@@ -46,67 +46,32 @@ is_port_free() {
     ! ss -tuln | grep -q ":$1 "
 }
 
-# Автоматический поиск свободного порта
+# Автоматический поиск свободного порта (вывод ТОЛЬКО в stderr, возврат через stdout)
 find_free_port() {
-    echo -e "${YELLOW}[*] Автоматический поиск свободного порта...${NC}"
+    echo -e "${YELLOW}[*] Автоматический поиск свободного порта...${NC}" >&2
     
     for port in "${PREFERRED_PORTS[@]}"; do
         if is_port_free "$port"; then
-            echo -e "${GREEN}[+] Найден свободный порт: $port${NC}"
+            echo -e "${GREEN}[+] Найден свободный порт: $port${NC}" >&2
             echo "$port"
             return 0
         else
-            echo -e "${YELLOW}    Порт $port занят, пробуем следующий...${NC}"
+            echo -e "${YELLOW}    Порт $port занят, пробуем следующий...${NC}" >&2
         fi
     done
     
     # Если все приоритетные заняты, ищем любой свободный
-    echo -e "${YELLOW}[*] Все приоритетные порты заняты. Поиск любого свободного...${NC}"
+    echo -e "${YELLOW}[*] Все приоритетные порты заняты. Поиск любого свободного...${NC}" >&2
     for port in $(seq 10000 11000); do
         if is_port_free "$port"; then
-            echo -e "${GREEN}[+] Найден свободный порт: $port (из диапазона 10000-11000)${NC}"
+            echo -e "${GREEN}[+] Найден свободный порт: $port (из диапазона 10000-11000)${NC}" >&2
             echo "$port"
             return 0
         fi
     done
     
-    echo -e "${RED}[!] Не удалось найти свободный порт!${NC}"
+    echo -e "${RED}[!] Не удалось найти свободный порт!${NC}" >&2
     return 1
-}
-
-# Проверка доступности порта снаружи (эвристика)
-check_external_access() {
-    local port=$1
-    echo -e "${YELLOW}[*] Проверка доступности порта $port снаружи...${NC}"
-    
-    # Пробуем получить свой внешний IP
-    local ext_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    if [ -z "$ext_ip" ]; then
-        echo -e "${RED}[!] Не удалось определить внешний IP${NC}"
-        return 1
-    fi
-    
-    # Проверяем через онлайн-сервисы проверки портов
-    if command -v timeout &>/dev/null; then
-        local check_result=$(timeout 10 curl -s "https://portchecker.co/check?host=$ext_ip&port=$port" 2>/dev/null | grep -o '"open":true' || echo "failed")
-        if [[ "$check_result" == *"true"* ]]; then
-            echo -e "${GREEN}[+] Порт $port доступен снаружи${NC}"
-            return 0
-        fi
-    fi
-    
-    # Альтернативная проверка через nmap если есть
-    if command -v nmap &>/dev/null; then
-        echo -e "${YELLOW}[*] Проверка через nmap...${NC}"
-        if nmap -p "$port" "$ext_ip" 2>/dev/null | grep -q "open"; then
-            echo -e "${GREEN}[+] Порт $port открыт${NC}"
-            return 0
-        fi
-    fi
-    
-    echo -e "${YELLOW}[!] Не удалось подтвердить доступность порта снаружи${NC}"
-    echo -e "${YELLOW}[!] Проверьте файрвол (iptables/ufw) и безопасность облака${NC}"
-    return 0  # Не блокируем установку, просто предупреждаем
 }
 
 # Проверка и настройка файрвола
@@ -115,18 +80,16 @@ check_firewall() {
     echo -e "${YELLOW}[*] Проверка файрвола...${NC}"
     
     # Проверяем ufw
-    if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
         echo -e "${YELLOW}[*] UFW активен. Открываю порт $port...${NC}"
-        ufw allow "$port/tcp" 2>/dev/null
-        echo -e "${GREEN}[+] Правило UFW добавлено${NC}"
+        ufw allow "$port/tcp" 2>/dev/null && echo -e "${GREEN}[+] Правило UFW добавлено${NC}"
     fi
     
     # Проверяем iptables
     if command -v iptables &>/dev/null; then
-        if ! iptables -L INPUT -n | grep -q "dpt:$port"; then
+        if ! iptables -L INPUT -n 2>/dev/null | grep -q "dpt:$port"; then
             echo -e "${YELLOW}[*] Добавляю правило iptables для порта $port...${NC}"
-            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-            echo -e "${GREEN}[+] Правило iptables добавлено${NC}"
+            iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null && echo -e "${GREEN}[+] Правило iptables добавлено${NC}"
         fi
     fi
     
@@ -148,9 +111,8 @@ validate_public_host() {
         return 0
     fi
     
-    # Проверка на доменное имя (простая)
+    # Проверка на доменное имя
     if [[ "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]; then
-        # Проверяем, что домен резолвится
         if host "$host" &>/dev/null; then
             return 0
         else
@@ -166,32 +128,56 @@ validate_public_host() {
 # --- УСТАНОВКА БИНАРНИКА ---
 install_binary() {
     echo -e "${YELLOW}[*] Установка зависимостей и бинарника...${NC}"
-    apt-get update -qq && apt-get install -y wget tar xxd qrencode openssl curl jq iproute2 host dnsutils >/dev/null 2>&1
-
+    
+    # Установка пакетов
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
+    apt-get install -y -qq wget tar xxd qrencode openssl curl jq iproute2 host dnsutils 2>/dev/null
+    
+    # Определение архитектуры
     ARCH=$(uname -m)
     LIBC_TYPE=$(ldd --version 2>&1 | grep -iq musl && echo "musl" || echo "gnu")
     URL="https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH}-linux-${LIBC_TYPE}.tar.gz"
     
-    echo -e "${YELLOW}[*] Скачивание: $URL${NC}"
-    if wget -qO- "$URL" | tar -xz; then
-        mv -f telemt "$BINARY_PATH"
-        chmod +x "$BINARY_PATH"
-        echo -e "${GREEN}[+] Бинарник установлен в $BINARY_PATH${NC}"
+    echo -e "${YELLOW}[*] Скачивание telemt...${NC}"
+    echo -e "${BLUE}URL: $URL${NC}"
+    
+    # Создаем временную директорию для распаковки
+    TMP_DIR=$(mktemp -d)
+    cd "$TMP_DIR"
+    
+    if wget -qO telemt.tar.gz "$URL" 2>/dev/null; then
+        tar -xzf telemt.tar.gz 2>/dev/null
+        if [ -f telemt ]; then
+            mv -f telemt "$BINARY_PATH"
+            chmod +x "$BINARY_PATH"
+            echo -e "${GREEN}[+] Бинарник установлен в $BINARY_PATH${NC}"
+            rm -rf "$TMP_DIR"
+        else
+            echo -e "${RED}[!] Архив распакован, но бинарник не найден${NC}"
+            ls -la "$TMP_DIR"
+            rm -rf "$TMP_DIR"
+            return 1
+        fi
     else
-        echo -e "${RED}[!] Ошибка загрузки бинарника! Проверьте URL${NC}"
+        echo -e "${RED}[!] Ошибка загрузки! Проверьте URL${NC}"
+        rm -rf "$TMP_DIR"
         return 1
     fi
     
+    # Создание пользователя
     if ! id -u telemt >/dev/null 2>&1; then
-        useradd -d /opt/telemt -m -r -U telemt
+        useradd -d /opt/telemt -m -r -U telemt 2>/dev/null
         echo -e "${GREEN}[+] Пользователь telemt создан${NC}"
     fi
     
     init_dirs
-    chown -R telemt:telemt "$CONFIG_DIR"
+    chown -R telemt:telemt "$CONFIG_DIR" 2>/dev/null
+    chown -R telemt:telemt /opt/telemt 2>/dev/null
+    
+    return 0
 }
 
-# --- ГЕНЕРАЦИЯ КОНФИГА ---
+# --- ГЕНЕРАЦИЯ КОНФИГА (чистый TOML без мусора) ---
 generate_config() {
     local port=$1
     local secret=$2
@@ -199,13 +185,17 @@ generate_config() {
     local tag=$4
     local public_host=$5
     
-    # Валидация public_host
-    if [ -z "$public_host" ]; then
-        echo -e "${RED}[!] Публичный адрес не указан${NC}"
+    # Валидация параметров
+    if [ -z "$public_host" ] || [ -z "$port" ] || [ -z "$secret" ] || [ -z "$domain" ] || [ -z "$tag" ]; then
+        echo -e "${RED}[!] Ошибка: не все параметры указаны${NC}"
+        echo -e "DEBUG: host='$public_host' port='$port' secret='$secret' domain='$domain' tag='$tag'"
         return 1
     fi
-
-    cat <<EOF > "$CONFIG_FILE"
+    
+    echo -e "${YELLOW}[*] Создание конфигурации...${NC}"
+    
+    # Создаем конфиг с ПРАВИЛЬНЫМ форматированием
+    cat > "$CONFIG_FILE" << EOF
 [general]
 use_middle_proxy = true
 ad_tag = "$tag"
@@ -242,20 +232,37 @@ tls_front_dir = "tlsfront"
 tg_user = "$secret"
 EOF
     
-    if [ $? -eq 0 ]; then
-        chown telemt:telemt "$CONFIG_FILE"
-        echo -e "${GREEN}[+] Конфиг создан: $CONFIG_FILE${NC}"
-        echo -e "${BLUE}[i] Публичный хост: $public_host:$port${NC}"
-        echo -e "${BLUE}[i] Fake TLS домен: $domain${NC}"
-    else
-        echo -e "${RED}[!] Ошибка создания конфига${NC}"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}[!] Ошибка записи конфига${NC}"
         return 1
     fi
+    
+    # Проверка конфига на мусор
+    if grep -q "\[*\]" "$CONFIG_FILE" || grep -q "\[+\]" "$CONFIG_FILE" || grep -q "\[!\]" "$CONFIG_FILE"; then
+        echo -e "${RED}[!] Обнаружен мусор в конфиге!${NC}"
+        echo -e "${YELLOW}[*] Содержимое конфига:${NC}"
+        cat "$CONFIG_FILE"
+        return 1
+    fi
+    
+    # Устанавливаем права
+    chown telemt:telemt "$CONFIG_FILE" 2>/dev/null
+    chmod 640 "$CONFIG_FILE" 2>/dev/null
+    
+    echo -e "${GREEN}[+] Конфиг создан успешно${NC}"
+    echo -e "${BLUE}[i] Проверка конфига:${NC}"
+    echo -e "${BLUE}    public_host = $public_host${NC}"
+    echo -e "${BLUE}    public_port = $port${NC}"
+    echo -e "${BLUE}    tls_domain = $domain${NC}"
+    
+    return 0
 }
 
 # --- СОЗДАНИЕ СЛУЖБЫ ---
 manage_service() {
-    cat <<EOF > "$SERVICE_FILE"
+    echo -e "${YELLOW}[*] Настройка systemd сервиса...${NC}"
+    
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Telemt Proxy Service
 After=network-online.target
@@ -279,30 +286,26 @@ WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    systemctl enable telemt
-    systemctl restart telemt
+    systemctl enable telemt 2>/dev/null
     
-    echo -e "${YELLOW}[*] Ожидание запуска сервиса...${NC}"
-    sleep 3
+    echo -e "${YELLOW}[*] Запуск сервиса...${NC}"
+    systemctl restart telemt
+    sleep 2
     
     if systemctl is-active --quiet telemt; then
         echo -e "${GREEN}[+] Сервис telemt запущен успешно${NC}"
         
-        # Показываем информацию для диагностики
-        echo -e "\n${BLUE}=== Информация для диагностики ===${NC}"
-        echo -e "Слушающие порты:"
-        ss -tlnp | grep "$BINARY_PATH" || echo "Не удалось определить"
+        # Показываем информацию
+        echo -e "\n${BLUE}=== Открытые порты ===${NC}"
+        ss -tlnp 2>/dev/null | grep -E "telemt|$(cat $PORT_FILE 2>/dev/null)" || echo "Не удалось определить"
         
-        # Проверяем API
-        if curl -s http://127.0.0.1:9091/v1/users >/dev/null 2>&1; then
-            echo -e "${GREEN}[+] API доступен на 127.0.0.1:9091${NC}"
-        else
-            echo -e "${YELLOW}[!] API пока недоступен (может потребоваться время)${NC}"
-        fi
+        return 0
     else
         echo -e "${RED}[!] Сервис не запустился${NC}"
-        echo -e "${YELLOW}[*] Логи для диагностики:${NC}"
-        journalctl -u telemt -n 10 --no-pager
+        echo -e "${YELLOW}[*] Статус:${NC}"
+        systemctl status telemt --no-pager -l
+        echo -e "\n${YELLOW}[*] Последние логи:${NC}"
+        journalctl -u telemt -n 20 --no-pager
         return 1
     fi
 }
@@ -322,7 +325,7 @@ menu_install() {
     echo "3) github.com"
     echo "4) microsoft.com"
     echo "5) Свой вариант"
-    read -p "Выбор: " d_idx
+    read -p "Выбор (1-5): " d_idx
     case $d_idx in
         2) domain="google.com" ;;
         3) domain="github.com" ;;
@@ -345,22 +348,30 @@ menu_install() {
     echo "$domain" > "$DOMAIN_FILE"
     echo -e "${GREEN}[+] Fake TLS домен: $domain${NC}"
 
-    # 2. Публичный адрес (ВАЖНОЕ ИСПРАВЛЕНИЕ!)
+    # 2. Публичный адрес
     echo -e "\n${YELLOW}Шаг 2: Настройка публичного адреса${NC}"
-    echo -e "${BLUE}(Это адрес, по которому клиенты будут подключаться)${NC}"
+    echo -e "${BLUE}(Это адрес, по которому клиенты будут подключаться к прокси)${NC}"
     
-    # Определяем IP сервера
+    # Получаем IP разными способами
     server_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
     if [ -z "$server_ip" ]; then
-        server_ip=$(hostname -I | awk '{print $1}')
+        server_ip=$(curl -s -4 --connect-timeout 5 https://ifconfig.me 2>/dev/null)
+    fi
+    if [ -z "$server_ip" ]; then
+        server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     fi
     
-    echo -e "${CYAN}IP сервера: $server_ip${NC}"
+    if [ -z "$server_ip" ]; then
+        echo -e "${RED}[!] Не удалось определить IP сервера${NC}"
+        read -p "Введите IP вручную: " server_ip
+    fi
+    
+    echo -e "${CYAN}Текущий IP сервера: $server_ip${NC}"
     echo ""
     echo "1) Использовать IP сервера ($server_ip)"
-    echo "2) Использовать другой IP"
-    echo "3) Использовать свой домен (рекомендуется!)"
-    read -p "Выбор: " host_choice
+    echo "2) Ввести другой IP"
+    echo "3) Использовать свой домен (если настроен DNS)"
+    read -p "Выбор (1-3): " host_choice
     
     case $host_choice in
         2)
@@ -378,7 +389,7 @@ menu_install() {
                 read -p "Введите ваш домен (например: proxy.example.com): " public_host
                 if validate_public_host "$public_host"; then
                     echo -e "${GREEN}[+] Домен $public_host принят${NC}"
-                    echo -e "${YELLOW}[!] Убедитесь, что DNS A-запись указывает на IP сервера ($server_ip)${NC}"
+                    echo -e "${YELLOW}[!] Убедитесь, что A-запись домена указывает на IP: $server_ip${NC}"
                     break
                 fi
             done
@@ -394,14 +405,13 @@ menu_install() {
     # 3. Автоматический подбор порта
     echo -e "\n${YELLOW}Шаг 3: Автоматический подбор порта${NC}"
     
-    free_port=$(find_free_port)
-    if [ -z "$free_port" ]; then
-        echo -e "${RED}[!] Не удалось найти свободный порт${NC}"
-        return 1
-    fi
+    # Вызываем find_free_port, весь вывод идет в stderr, только порт в stdout
+    free_port=$(find_free_port 2>&1)
+    # Извлекаем только число из возможного мусора
+    free_port=$(echo "$free_port" | grep -oE '[0-9]+' | tail -1)
     
-    read -p "Использовать порт $free_port? (Y/n): " port_confirm
-    if [ "$port_confirm" = "n" ] || [ "$port_confirm" = "N" ]; then
+    if [ -z "$free_port" ] || [ "$free_port" -lt 1 ] || [ "$free_port" -gt 65535 ]; then
+        echo -e "${RED}[!] Не удалось найти свободный порт автоматически${NC}"
         while true; do
             read -p "Введите порт вручную: " free_port
             if [[ "$free_port" =~ ^[0-9]+$ ]] && [ "$free_port" -ge 1 ] && [ "$free_port" -le 65535 ]; then
@@ -411,26 +421,41 @@ menu_install() {
                     echo -e "${RED}[!] Порт $free_port занят${NC}"
                 fi
             else
-                echo -e "${RED}[!] Некорректный порт${NC}"
+                echo -e "${RED}[!] Некорректный порт (1-65535)${NC}"
             fi
         done
+    else
+        read -p "Использовать порт $free_port? (Y/n): " port_confirm
+        if [ "$port_confirm" = "n" ] || [ "$port_confirm" = "N" ]; then
+            while true; do
+                read -p "Введите порт вручную: " free_port
+                if [[ "$free_port" =~ ^[0-9]+$ ]] && [ "$free_port" -ge 1 ] && [ "$free_port" -le 65535 ]; then
+                    if is_port_free "$free_port"; then
+                        break
+                    else
+                        echo -e "${RED}[!] Порт $free_port занят${NC}"
+                    fi
+                else
+                    echo -e "${RED}[!] Некорректный порт${NC}"
+                fi
+            done
+        fi
     fi
     
     echo "$free_port" > "$PORT_FILE"
     echo -e "${GREEN}[+] Выбран порт: $free_port${NC}"
     
-    # Проверка внешней доступности и файрвола
+    # Проверка файрвола
     check_firewall "$free_port"
-    check_external_access "$free_port"
 
     # 4. Генерация секретов
     echo -e "\n${YELLOW}Шаг 4: Генерация ключей безопасности${NC}"
     secret=$(openssl rand -hex 16)
     echo "$secret" > "$SECRET_FILE"
-    echo -e "${GREEN}[+] Secret ключ сгенерирован${NC}"
+    echo -e "${GREEN}[+] Secret ключ сгенерирован: ${secret:0:8}...${NC}"
     
     # Тег
-    if [ -f "$TAG_FILE" ]; then
+    if [ -f "$TAG_FILE" ] && [ -s "$TAG_FILE" ]; then
         tag=$(cat "$TAG_FILE")
         echo -e "${GREEN}[+] Использован существующий AD TAG: $tag${NC}"
     else
@@ -441,37 +466,42 @@ menu_install() {
     
     # Сохраняем IP
     echo "$server_ip" > "$IP_FILE"
+    
+    echo -e "\n${CYAN}=== Начало установки ===${NC}"
+    echo -e "${YELLOW}Параметры:${NC}"
+    echo -e "  Публичный адрес: ${GREEN}$public_host${NC}"
+    echo -e "  Порт: ${GREEN}$free_port${NC}"
+    echo -e "  Fake TLS: ${GREEN}$domain${NC}"
+    echo -e "  AD TAG: ${GREEN}$tag${NC}"
+    echo ""
 
     # Установка
-    echo -e "\n${CYAN}=== Начало установки ===${NC}"
-    
     if ! install_binary; then
-        echo -e "${RED}[!] Ошибка установки бинарника${NC}"
+        echo -e "${RED}[!] КРИТИЧЕСКАЯ ОШИБКА: установка бинарника${NC}"
         return 1
     fi
     
     if ! generate_config "$free_port" "$secret" "$domain" "$tag" "$public_host"; then
-        echo -e "${RED}[!] Ошибка генерации конфига${NC}"
+        echo -e "${RED}[!] КРИТИЧЕСКАЯ ОШИБКА: создание конфига${NC}"
         return 1
     fi
     
     if ! manage_service; then
-        echo -e "${RED}[!] Ошибка запуска сервиса${NC}"
+        echo -e "${RED}[!] КРИТИЧЕСКАЯ ОШИБКА: запуск сервиса${NC}"
+        echo -e "${YELLOW}[*] Проверьте конфиг вручную:${NC}"
+        echo -e "cat $CONFIG_FILE"
         return 1
     fi
     
     echo -e "\n${GREEN}=== Установка успешно завершена! ===${NC}"
     
-    # Важная диагностика
-    echo -e "\n${BLUE}=== ВАЖНО: Проверки подключения ===${NC}"
-    echo -e "1. Убедитесь, что в облачном провайдере (Hetzner, AWS, etc.) открыт порт $free_port"
-    echo -e "2. Если используете домен, проверьте DNS:"
-    echo -e "   ${CYAN}host $public_host${NC}"
-    if [ "$public_host" != "$server_ip" ]; then
-        echo -e "   Должен возвращать IP: $server_ip"
-    fi
-    echo -e "3. Для теста выполните с клиента:"
+    # Важная информация
+    echo -e "\n${BLUE}=== ВАЖНО: Действия для подключения ===${NC}"
+    echo -e "1. Убедитесь, что порт ${CYAN}$free_port${NC} открыт в облачном фаерволе"
+    echo -e "2. Проверьте доступность снаружи:"
     echo -e "   ${CYAN}curl -v https://$public_host:$free_port${NC}"
+    echo -e "3. Если используется домен, проверьте DNS:"
+    echo -e "   ${CYAN}host $public_host${NC}"
     
     show_data
     read -p "Нажмите Enter для продолжения..."
@@ -481,15 +511,17 @@ menu_install() {
 show_data() {
     if ! systemctl is-active --quiet telemt; then 
         echo -e "${RED}[!] Сервис не запущен!${NC}"
+        echo -e "${YELLOW}[*] Запустите: systemctl start telemt${NC}"
         return
     fi
     
     echo -e "\n${GREEN}=== Данные для подключения ===${NC}"
     
     # Ждем API
-    echo -e "${YELLOW}[*] Получение данных от API...${NC}"
-    for i in {1..10}; do
+    echo -e "${YELLOW}[*] Ожидание готовности API...${NC}"
+    for i in {1..15}; do
         if curl -s http://127.0.0.1:9091/v1/users >/dev/null 2>&1; then
+            echo -e "${GREEN}[+] API готов${NC}"
             break
         fi
         echo -n "."
@@ -500,18 +532,16 @@ show_data() {
     RAW_DATA=$(curl -s http://127.0.0.1:9091/v1/users)
     if [ -z "$RAW_DATA" ]; then
         echo -e "${RED}[!] API не отвечает${NC}"
-        echo -e "${YELLOW}[*] Попробуйте позже или проверьте логи:${NC}"
-        echo -e "journalctl -u telemt -f"
+        echo -e "${YELLOW}[*] Попробуйте позже: systemctl restart telemt${NC}"
         return
     fi
     
-    # Парсим все ссылки
-    echo -e "\n${CYAN}Ссылки TLS:${NC}"
+    # Парсим ссылки
+    echo -e "\n${CYAN}Ссылки для подключения:${NC}"
     echo "$RAW_DATA" | jq -r '.data[0].links.tls[]' 2>/dev/null | while read link; do
         if [ ! -z "$link" ] && [ "$link" != "null" ]; then
             echo -e "${GREEN}$link${NC}"
             echo ""
-            echo -e "${YELLOW}QR-код:${NC}"
             qrencode -t ANSIUTF8 "$link" 2>/dev/null
             echo ""
         fi
@@ -519,9 +549,9 @@ show_data() {
     
     # Дополнительная диагностика
     echo -e "\n${BLUE}=== Диагностика ===${NC}"
-    echo -e "Конфиг файл: $CONFIG_FILE"
-    echo -e "Публичный хост: $(cat $PUBLIC_HOST_FILE 2>/dev/null || echo 'не найден')"
-    echo -e "Порт: $(cat $PORT_FILE 2>/dev/null || echo 'не найден')"
+    echo -e "Конфиг: $CONFIG_FILE"
+    echo -e "Содержимое конфига:"
+    cat "$CONFIG_FILE" 2>/dev/null | head -15
 }
 
 # --- ОСНОВНОЙ ЦИКЛ ---
@@ -531,7 +561,7 @@ init_dirs
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║     Telemt Proxy Manager v2.0       ║${NC}"
+    echo -e "${CYAN}║     Telemt Proxy Manager v2.1       ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     echo "1) 🚀 Установить / Обновить прокси"
     echo "2) 📱 Показать QR-коды и ссылки"
@@ -539,7 +569,8 @@ while true; do
     echo "4) 📊 Статус и логи сервиса"
     echo "5) 🔄 Перезапустить сервис"
     echo "6) 🔍 Диагностика подключения"
-    echo "7) 🗑️  Полное удаление"
+    echo "7) 📝 Показать конфиг"
+    echo "8) 🗑️  Полное удаление"
     echo "0) Выход"
     echo ""
     
@@ -552,36 +583,52 @@ while true; do
     read -p "Выбор: " idx
     
     case $idx in
-        1) menu_install ;;
-        2) show_data; read -p "Нажмите Enter..." ;;
+        1) 
+            # Останавливаем сервис перед переустановкой
+            systemctl stop telemt 2>/dev/null
+            menu_install 
+            ;;
+        2) 
+            show_data
+            read -p "Нажмите Enter..." 
+            ;;
         3) 
-            read -p "Введите AD TAG (hex, 32 символа): " nt
+            read -p "Введите AD TAG (32 hex символа): " nt
             if [ ${#nt} -eq 32 ] && [[ "$nt" =~ ^[0-9a-fA-F]+$ ]]; then
                 echo "$nt" > "$TAG_FILE"
                 if [ -f "$PORT_FILE" ] && [ -f "$SECRET_FILE" ] && [ -f "$DOMAIN_FILE" ] && [ -f "$PUBLIC_HOST_FILE" ]; then
-                    generate_config "$(cat $PORT_FILE)" "$(cat $SECRET_FILE)" "$(cat $DOMAIN_FILE)" "$nt" "$(cat $PUBLIC_HOST_FILE)"
+                    port=$(cat "$PORT_FILE")
+                    secret=$(cat "$SECRET_FILE")
+                    domain=$(cat "$DOMAIN_FILE")
+                    public_host=$(cat "$PUBLIC_HOST_FILE")
+                    
+                    generate_config "$port" "$secret" "$domain" "$nt" "$public_host"
                     systemctl restart telemt
                     echo -e "${GREEN}[+] AD TAG обновлен!${NC}"
+                else
+                    echo -e "${RED}[!] Не найдены файлы конфигурации. Выполните установку${NC}"
                 fi
             else
-                echo -e "${RED}[!] TAG должен быть 32 hex-символа${NC}"
+                echo -e "${RED}[!] TAG должен быть 32 символа (0-9, a-f)${NC}"
             fi
             sleep 2 
             ;;
         4) 
             echo -e "${YELLOW}=== Статус сервиса ===${NC}"
-            systemctl status telemt --no-pager
+            systemctl status telemt --no-pager -l
             echo -e "\n${YELLOW}=== Последние логи (30 строк) ===${NC}"
             journalctl -u telemt -n 30 --no-pager
             read -p "Нажмите Enter..." 
             ;;
         5)
+            echo -e "${YELLOW}[*] Перезапуск сервиса...${NC}"
             systemctl restart telemt
             sleep 2
             if systemctl is-active --quiet telemt; then
                 echo -e "${GREEN}[+] Сервис перезапущен${NC}"
             else
                 echo -e "${RED}[!] Ошибка перезапуска${NC}"
+                journalctl -u telemt -n 10 --no-pager
             fi
             sleep 2
             ;;
@@ -591,33 +638,56 @@ while true; do
             port=$(cat "$PORT_FILE" 2>/dev/null || echo "неизвестен")
             public_host=$(cat "$PUBLIC_HOST_FILE" 2>/dev/null || echo "неизвестен")
             
-            echo -e "Публичный адрес: $public_host:$port"
+            echo -e "Публичный адрес: ${CYAN}$public_host:$port${NC}"
             
             # Проверка порта локально
-            if ss -tlnp | grep -q ":$port "; then
+            echo -e "\n${YELLOW}Локальные слушающие порты:${NC}"
+            if ss -tlnp 2>/dev/null | grep -q ":$port "; then
                 echo -e "${GREEN}[+] Порт $port слушается локально${NC}"
+                ss -tlnp | grep ":$port "
             else
                 echo -e "${RED}[!] Порт $port не слушается${NC}"
             fi
             
             # Проверка файрвола
-            echo -e "\nПравила iptables для порта $port:"
-            iptables -L INPUT -n | grep "dpt:$port" || echo "Нет правил"
+            echo -e "\n${YELLOW}Правила iptables:${NC}"
+            iptables -L INPUT -n 2>/dev/null | grep "dpt:$port" || echo "Нет правил для порта $port"
             
-            # Проверка DNS если используется домен
-            if [[ "$public_host" =~ [a-zA-Z] ]]; then
-                echo -e "\nDNS резолвинг:"
+            # Проверка DNS для доменов
+            if [[ ! "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo -e "\n${YELLOW}DNS резолвинг:${NC}"
                 host "$public_host" 2>&1
             fi
             
-            echo -e "\nАктивные подключения к telemt:"
-            ss -tnp | grep telemt | head -5
+            # Активные подключения
+            echo -e "\n${YELLOW}Активные подключения telemt:${NC}"
+            ss -tnp 2>/dev/null | grep telemt | head -5 || echo "Нет активных подключений"
+            
+            # Проверка конфига
+            echo -e "\n${YELLOW}Валидация конфига:${NC}"
+            if [ -f "$CONFIG_FILE" ]; then
+                if grep -q "^public_port = [0-9]" "$CONFIG_FILE"; then
+                    echo -e "${GREEN}[+] Конфиг выглядит корректно${NC}"
+                else
+                    echo -e "${RED}[!] Проблема в конфиге! Содержимое:${NC}"
+                    head -15 "$CONFIG_FILE"
+                fi
+            fi
             
             read -p "Нажмите Enter..."
             ;;
-        7) 
+        7)
+            echo -e "${YELLOW}=== Содержимое конфига ===${NC}"
+            if [ -f "$CONFIG_FILE" ]; then
+                cat "$CONFIG_FILE"
+            else
+                echo -e "${RED}[!] Конфиг не найден${NC}"
+            fi
+            read -p "Нажмите Enter..."
+            ;;
+        8) 
             echo -e "${RED}[!] ВНИМАНИЕ: Полное удаление Telemt!${NC}"
-            read -p "Вы уверены? (yes/N): " confirm
+            read -p "Введите 'yes' для подтверждения: " confirm
             if [ "$confirm" = "yes" ]; then
                 systemctl stop telemt 2>/dev/null
                 systemctl disable telemt 2>/dev/null
