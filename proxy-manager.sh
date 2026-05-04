@@ -90,15 +90,28 @@ menu_install() {
     fi
     echo "$PUB_HOST" > "$CONFIG_FILE"
 
-    echo -e "\n${CYAN}--- Выбор порта ---${NC}"
-    read -p "Введите порт [по умолчанию 443]: " PORT
-    PORT=${PORT:-443}
+    # --- АВТОПОДБОР ПОРТА ---
+    PORT=443
+    echo -ne "\n🔍 Проверка порта ${PORT}... "
+    if ss -tuln | grep -q ":${PORT} "; then
+        echo -e "${YELLOW}занят${NC}"
+        for alt_port in 9443 8443 8444 8445; do
+            if ! ss -tuln | grep -q ":${alt_port} "; then
+                PORT=$alt_port
+                echo -e "✅ Испольуем свободный порт: ${GREEN}${PORT}${NC}"
+                break
+            fi
+        done
+    else
+        echo -e "${GREEN}свободен${NC}"
+    fi
 
     echo -e "\n${YELLOW}[*] Настройка прокси...${NC}"
     SECRET=$(docker run --rm nineseconds/mtg:2 generate-secret --hex "$FAKE_DOMAIN")
     
     docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null
     
+    # Запуск mtg v2
     docker run -d --name mtproto-proxy --restart always -p "$PORT":"$PORT" \
         nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$PORT" "$SECRET" > /dev/null
     
@@ -114,7 +127,7 @@ install_deps
 while true; do
     clear
     echo -e "${BLUE}======================================${NC}"
-    echo -e "${WHITE}    MTProto Proxy Manager (Clean)     ${NC}"
+    echo -e "${WHITE}    Hikamo Proxy Manager     ${NC}"
     echo -e "${BLUE}======================================${NC}"
     echo -e "1) ${GREEN}Установить / Обновить прокси${NC}"
     echo -e "2) Показать данные и QR-код${NC}"
