@@ -1,161 +1,168 @@
 #!/bin/bash
 
 # --- КОНФИГУРАЦИЯ ---
-BINARY_PATH="/usr/local/bin/proxy-manager"
-CONFIG_FILE="/etc/proxy_public_domain.conf"
-TAG_FILE="/etc/proxy_ad_tag.conf"
-BASE_SECRET_FILE="/etc/proxy_base_secret.conf"
+BINARY_URL="https://github.com/9seconds/mtg/releases/download/v2.1.7/mtg-2.1.7-linux-amd64.tar.gz"
+BINARY_PATH="/usr/local/bin/mtg"
+SERVICE_FILE="/etc/systemd/system/mtg.service"
+CONFIG_DIR="/etc/mtg-proxy"
+IP_FILE="$CONFIG_DIR/host.conf"
+TAG_FILE="$CONFIG_DIR/tag.conf"
+SECRET_FILE="$CONFIG_DIR/secret.conf"
+BOT_SECRET_FILE="$CONFIG_DIR/bot_secret.conf"
 
 # --- ЦВЕТА ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
-WHITE='\033[1;37m'
-BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
 NC='\033[0m'
+
+# --- ИНИЦИАЛИЗАЦИЯ ---
+mkdir -p "$CONFIG_DIR"
 
 check_root() {
     if [ "$EUID" -ne 0 ]; then echo -e "${RED}Ошибка: запустите через sudo!${NC}"; exit 1; fi
 }
 
-install_deps() {
-    if ! command -v docker &> /dev/null; then
-        curl -fsSL https://get.docker.com | sh
-        systemctl enable --now docker
+# Функция скачивания и установки бинарника
+install_mtg() {
+    if [ ! -f "$BINARY_PATH" ]; then
+        echo -e "${YELLOW}[*] Скачивание и установка mtg...${NC}"
+        apt-get update && apt-get install -y wget tar xxd qrencode openssl
+        wget -qO mtg.tar.gz "$BINARY_URL"
+        tar -xof mtg.tar.gz
+        mv mtg-*/mtg "$BINARY_PATH"
+        chmod +x "$BINARY_PATH"
+        rm -rf mtg.tar.gz mtg-*
+        echo -e "${GREEN}[+] mtg успешно установлен в $BINARY_PATH${NC}"
     fi
-    if ! command -v qrencode &> /dev/null; then
-        apt-get update && apt-get install -y qrencode || yum install -y qrencode
-    fi
-    cp "$0" "$BINARY_PATH" && chmod +x "$BINARY_PATH"
 }
 
-get_ip() {
-    curl -s -4 --max-time 5 https://api.ipify.org || echo "0.0.0.0"
-}
-
-get_current_params() {
-    # Извлекаем последний аргумент из команды запуска (это всегда секрет)
-    CUR_SECRET=$(docker inspect mtproto-proxy --format='{{index .Config.Cmd (sub (len .Config.Cmd) 1)}}' 2>/dev/null)
-    CUR_PORT=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
-}
-
-# Вспомогательная функция для inspect (sub не всегда есть в старых docker)
-docker_get_secret() {
-    docker inspect mtproto-proxy --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}'
-}
+get_ip() { curl -s -4 https://api.ipify.org || echo "0.0.0.0"; }
 
 show_config() {
-    if ! docker ps | grep -q "mtproto-proxy"; then 
-        echo -e "${RED}Прокси не запущен!${NC}"
-        return
-    fi
+    if ! systemctl is-active --quiet mtg; then echo -e "${RED}Сервис не запущен!${NC}"; return; fi
     
-    CUR_SECRET=$(docker_get_secret)
-    CUR_PORT=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
-    
-    HOST=$( [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE" || get_ip )
-    AD_TAG=$( [ -f "$TAG_FILE" ] && cat "$TAG_FILE" || echo "отсутствует" )
-    BOT_SECRET=$( [ -f "$BASE_SECRET_FILE" ] && cat "$BASE_SECRET_FILE" || echo "N/A" )
+    HOST=$(cat "$IP_FILE" 2>/dev/null || get_ip)
+    SECRET=$(cat "$SECRET_FILE" 2>/dev/null)
+    BOT_SECRET=$(cat "$BOT_SECRET_FILE" 2>/dev/null)
+    PORT=$(grep -oP '(?<=:)\d+(?= )' "$SERVICE_FILE" | head -n 1)
 
-    LINK="tg://proxy?server=$HOST&port=$CUR_PORT&secret=$CUR_SECRET"
+    LINK="tg://proxy?server=$HOST&port=$PORT&secret=$SECRET"
 
-    echo -e "\n${GREEN}=== ДАННЫЕ ДЛЯ ПОДКЛЮЧЕНИЯ (CLIENT) ===${NC}"
-    echo -e "Ссылка: ${BLUE}$LINK${NC}"
-    echo ""
+    echo -e "\n${GREEN}=== ДАННЫЕ ДЛЯ КЛИЕНТА ===${NC}"
+    echo -e "Ссылка: ${CYAN}$LINK${NC}\n"
     qrencode -t ANSIUTF8 "$LINK"
-
+    
     echo -e "${YELLOW}=== ДАННЫЕ ДЛЯ @MTProxybot ===${NC}"
-    echo -e "IP: ${WHITE}$HOST${NC} | Port: ${WHITE}$CUR_PORT${NC}"
-    echo -e "Secret: ${CYAN}$BOT_SECRET${NC}"
+    echo -e "IP: $HOST | Port: $PORT | Secret: $BOT_SECRET"
+    echo -e "Tag в системе: $(cat "$TAG_FILE" 2>/dev/null || echo "нет")"
     echo "------------------------------------------------"
+}
+
+manage_service() {
+    local port=$1
+    local secret=$2
+    local tag=$3
+    
+    AD_TAG=""
+    [ ! -z "$tag" ] && AD_TAG="-t $tag"
+
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=MTG MTProto Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$BINARY_PATH simple-run -n 1.1.1.1 -i prefer-ipv4 $AD_TAG 0.0.0.0:$port $secret
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable mtg
+    systemctl restart mtg
+    echo -e "${GREEN}[+] Сервис mtg запущен на порту $port${NC}"
 }
 
 menu_install() {
     clear
-    echo -e "${CYAN}--- Выбор домена Fake TLS ---${NC}"
-    domains=("max.ru" "lenta.ru" "rbc.ru" "ria.ru" "kommersant.ru" "yandex.ru" "google.com" "github.com" "wikipedia.org" "habr.com")
-    for i in "${!domains[@]}"; do
-        printf "${YELLOW}%2d)${NC} %-18s " "$((i+1))" "${domains[$i]}"
-        [[ $(( (i+1) % 2 )) -eq 0 ]] && echo ""
-    done
-    echo -ne "\nВыбор [1-10, default 1]: "
-    read d_idx
-    FAKE_DOMAIN=${domains[$((d_idx-1))]}
-    FAKE_DOMAIN=${FAKE_DOMAIN:-max.ru}
+    echo -e "${CYAN}--- Быстрая настройка прокси ---${NC}"
+    
+    # Пытаемся остановить докер версию если она есть
+    docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null
 
-    read -p "Ваш ДОМЕН для ссылки (пусто для IP): " PUB_HOST
+    read -p "Домен для маскировки (default: max.ru): " FAKE_DOMAIN
+    FAKE_DOMAIN=${FAKE_DOMAIN:-max.ru}
+    
+    read -p "Публичный домен/IP (Enter = авто): " PUB_HOST
     [ -z "$PUB_HOST" ] && PUB_HOST=$(get_ip)
-    echo "$PUB_HOST" > "$CONFIG_FILE"
+    echo "$PUB_HOST" > "$IP_FILE"
 
     PORT=443
-    if ss -tuln | grep -q ":${PORT} "; then
-        for alt_port in 9443 8443 8444 8445; do
-            if ! ss -tuln | grep -q ":${alt_port} "; then PORT=$alt_port; break; fi
-        done
-    fi
+    if ss -tuln | grep -q ":$PORT "; then PORT=9443; fi
+    read -p "Порт (default: $PORT): " USER_PORT
+    PORT=${USER_PORT:-$PORT}
 
-    # Генерация секрета
+    # Генерация секретов (Правильный 64-символьный Fake TLS)
     BASE_HEX=$(openssl rand -hex 16)
-    echo "$BASE_HEX" > "$BASE_SECRET_FILE"
+    echo "$BASE_HEX" > "$BOT_SECRET_FILE"
     
     DOMAIN_HEX=$(echo -n "$FAKE_DOMAIN" | xxd -p | tr -d '\n')
     RAW_SECRET="ee${BASE_HEX}${DOMAIN_HEX}"
     WORK_SECRET=$(printf '%.66s' "${RAW_SECRET}$(printf '0%.0s' {1..66})")
     WORK_SECRET=${WORK_SECRET:0:66}
+    echo "$WORK_SECRET" > "$SECRET_FILE"
 
-    run_container "$PORT" "$WORK_SECRET"
-}
-
-menu_set_tag() {
-    if ! docker ps | grep -q "mtproto-proxy"; then return; fi
-    read -p "Введите AD TAG: " NEW_TAG
-    if [ ! -z "$NEW_TAG" ]; then echo "$NEW_TAG" > "$TAG_FILE"; else rm -f "$TAG_FILE"; fi
-    
-    S=$(docker_get_secret)
-    P=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
-    run_container "$P" "$S"
-}
-
-run_container() {
-    local p=$1
-    local s=$2
-    local t=$( [ -f "$TAG_FILE" ] && cat "$TAG_FILE" )
-    
-    docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null
-    
-    # Конструкция для безопасной передачи тега
-    if [ ! -z "$t" ]; then
-        docker run -d --name mtproto-proxy --restart always -p "$p":"$p" \
-            nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 -t "$t" 0.0.0.0:"$p" "$s" > /dev/null
-    else
-        docker run -d --name mtproto-proxy --restart always -p "$p":"$p" \
-            nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$p" "$s" > /dev/null
-    fi
-    
-    echo -e "${GREEN}Готово!${NC}"
+    manage_service "$PORT" "$WORK_SECRET" ""
     show_config
     read -p "Нажмите Enter..."
 }
 
+menu_set_tag() {
+    clear
+    echo -e "${MAGENTA}--- Привязка канала (AD TAG) ---${NC}"
+    read -p "Введите TAG от @MTProxybot: " NEW_TAG
+    if [ ! -z "$NEW_TAG" ]; then
+        echo "$NEW_TAG" > "$TAG_FILE"
+        PORT=$(grep -oP '(?<=:)\d+(?= )' "$SERVICE_FILE" | head -n 1)
+        SECRET=$(cat "$SECRET_FILE")
+        manage_service "$PORT" "$SECRET" "$NEW_TAG"
+    else
+        echo "Тег не введен."
+        sleep 1
+    fi
+}
+
+# --- ЗАПУСК ---
 check_root
-install_deps
+install_mtg
 
 while true; do
     clear
-    echo -e "${BLUE}=== MTProto Manager (Fixed Launch) ===${NC}"
-    echo -e "1) ${GREEN}Установить прокси${NC}"
-    echo -e "2) Показать данные${NC}"
-    echo -e "3) Настроить AD TAG${NC}"
-    echo -e "4) ${RED}Удалить прокси${NC}"
-    echo -e "0) Выход${NC}"
-    read -p "Пункт: " m_idx
-    case $m_idx in
+    echo -e "${BLUE}======================================${NC}"
+    echo -e "      MTProto Proxy Systemd Manager   "
+    echo -e "${BLUE}======================================${NC}"
+    echo "1) Установить / Обновить прокси"
+    echo "2) Показать данные для клиента и бота"
+    echo "3) Добавить/Изменить AD TAG (промо-канал)"
+    echo "4) Посмотреть логи (диагностика)"
+    echo "5) Удалить прокси из системы"
+    echo "0) Выход"
+    echo "--------------------------------------"
+    read -p "Выбор: " idx
+    case $idx in
         1) menu_install ;;
-        2) clear; show_config; read -p "Нажмите Enter..." ;;
+        2) show_config; read -p "Нажмите Enter..." ;;
         3) menu_set_tag ;;
-        4) docker stop mtproto-proxy &>/dev/null; docker rm mtproto-proxy &>/dev/null; rm -f /etc/proxy_*.conf; echo "Удалено"; sleep 1 ;;
-        0) exit 0 ;;
+        4) clear; echo "Логи (для выхода нажмите Ctrl+C):"; journalctl -u mtg -n 50 -f ;;
+        5) systemctl stop mtg; systemctl disable mtg; rm -rf "$SERVICE_FILE" "$CONFIG_DIR" "$BINARY_PATH"; echo "Всё удалено"; sleep 1 ;;
+        0) exit ;;
     esac
 done
