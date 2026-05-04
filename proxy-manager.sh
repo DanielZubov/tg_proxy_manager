@@ -36,9 +36,14 @@ get_ip() {
 }
 
 get_current_params() {
-    CMD_ARGS=$(docker inspect mtproto-proxy --format='{{range .Config.Cmd}}{{.}} {{end}}' 2>/dev/null)
-    CUR_SECRET=$(echo $CMD_ARGS | awk '{print $NF}')
+    # Извлекаем последний аргумент из команды запуска (это всегда секрет)
+    CUR_SECRET=$(docker inspect mtproto-proxy --format='{{index .Config.Cmd (sub (len .Config.Cmd) 1)}}' 2>/dev/null)
     CUR_PORT=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
+}
+
+# Вспомогательная функция для inspect (sub не всегда есть в старых docker)
+docker_get_secret() {
+    docker inspect mtproto-proxy --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}'
 }
 
 show_config() {
@@ -46,7 +51,10 @@ show_config() {
         echo -e "${RED}Прокси не запущен!${NC}"
         return
     fi
-    get_current_params
+    
+    CUR_SECRET=$(docker_get_secret)
+    CUR_PORT=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
+    
     HOST=$( [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE" || get_ip )
     AD_TAG=$( [ -f "$TAG_FILE" ] && cat "$TAG_FILE" || echo "отсутствует" )
     BOT_SECRET=$( [ -f "$BASE_SECRET_FILE" ] && cat "$BASE_SECRET_FILE" || echo "N/A" )
@@ -72,7 +80,8 @@ menu_install() {
         printf "${YELLOW}%2d)${NC} %-18s " "$((i+1))" "${domains[$i]}"
         [[ $(( (i+1) % 2 )) -eq 0 ]] && echo ""
     done
-    read -p "Выбор [1-10, default 1]: " d_idx
+    echo -ne "\nВыбор [1-10, default 1]: "
+    read d_idx
     FAKE_DOMAIN=${domains[$((d_idx-1))]}
     FAKE_DOMAIN=${FAKE_DOMAIN:-max.ru}
 
@@ -81,24 +90,19 @@ menu_install() {
     echo "$PUB_HOST" > "$CONFIG_FILE"
 
     PORT=443
-    echo -ne "\n🔍 Проверка порта ${PORT}... "
     if ss -tuln | grep -q ":${PORT} "; then
         for alt_port in 9443 8443 8444 8445; do
             if ! ss -tuln | grep -q ":${alt_port} "; then PORT=$alt_port; break; fi
         done
     fi
-    echo -e "Используем: ${GREEN}$PORT${NC}"
 
-    # --- РУЧНАЯ ГЕНЕРАЦИЯ ПРАВИЛЬНОГО FAKE TLS СЕКРЕТА (64 символа) ---
-    RANDOM_PART=$(openssl rand -hex 16)
-    echo "$RANDOM_PART" > "$BASE_SECRET_FILE" # Это 32 символа для бота
+    # Генерация секрета
+    BASE_HEX=$(openssl rand -hex 16)
+    echo "$BASE_HEX" > "$BASE_SECRET_FILE"
     
     DOMAIN_HEX=$(echo -n "$FAKE_DOMAIN" | xxd -p | tr -d '\n')
-    # Склеиваем: ee + random(32) + domain_hex
-    RAW_SECRET="ee${RANDOM_PART}${DOMAIN_HEX}"
-    # Добиваем нулями до 64 символов (32 байта)
+    RAW_SECRET="ee${BASE_HEX}${DOMAIN_HEX}"
     WORK_SECRET=$(printf '%.66s' "${RAW_SECRET}$(printf '0%.0s' {1..66})")
-    # Обрезаем строго до 66 (ee + 64 символа)
     WORK_SECRET=${WORK_SECRET:0:66}
 
     run_container "$PORT" "$WORK_SECRET"
@@ -107,20 +111,30 @@ menu_install() {
 menu_set_tag() {
     if ! docker ps | grep -q "mtproto-proxy"; then return; fi
     read -p "Введите AD TAG: " NEW_TAG
-    [ ! -z "$NEW_TAG" ] && echo "$NEW_TAG" > "$TAG_FILE"
-    get_current_params
-    run_container "$CUR_PORT" "$CUR_SECRET"
+    if [ ! -z "$NEW_TAG" ]; then echo "$NEW_TAG" > "$TAG_FILE"; else rm -f "$TAG_FILE"; fi
+    
+    S=$(docker_get_secret)
+    P=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
+    run_container "$P" "$S"
 }
 
 run_container() {
     local p=$1
     local s=$2
     local t=$( [ -f "$TAG_FILE" ] && cat "$TAG_FILE" )
+    
     docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null
-    AD_ARG=""
-    [ ! -z "$t" ] && AD_ARG="-t $t"
-    docker run -d --name mtproto-proxy --restart always -p "$p":"$p" \
-        nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 $AD_ARG 0.0.0.0:"$p" "$s" > /dev/null
+    
+    # Конструкция для безопасной передачи тега
+    if [ ! -z "$t" ]; then
+        docker run -d --name mtproto-proxy --restart always -p "$p":"$p" \
+            nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 -t "$t" 0.0.0.0:"$p" "$s" > /dev/null
+    else
+        docker run -d --name mtproto-proxy --restart always -p "$p":"$p" \
+            nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$p" "$s" > /dev/null
+    fi
+    
+    echo -e "${GREEN}Готово!${NC}"
     show_config
     read -p "Нажмите Enter..."
 }
@@ -130,7 +144,7 @@ install_deps
 
 while true; do
     clear
-    echo -e "${BLUE}=== MTProto Manager (64-bit Secret Fix) ===${NC}"
+    echo -e "${BLUE}=== MTProto Manager (Fixed Launch) ===${NC}"
     echo -e "1) ${GREEN}Установить прокси${NC}"
     echo -e "2) Показать данные${NC}"
     echo -e "3) Настроить AD TAG${NC}"
