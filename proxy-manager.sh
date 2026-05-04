@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# --- КОНФИГУРАЦИЯ (по официальному гайду) ---
+# --- КОНФИГУРАЦИЯ (Telemt Official Standard) ---
 BINARY_PATH="/bin/telemt"
 CONFIG_DIR="/etc/telemt"
 CONFIG_FILE="$CONFIG_DIR/telemt.toml"
@@ -20,6 +20,8 @@ CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+# --- СЛУЖЕБНЫЕ ФУНКЦИИ ---
+
 check_root() {
     if [ "$EUID" -ne 0 ]; then echo -e "${RED}Ошибка: запустите от root!${NC}"; exit 1; fi
 }
@@ -28,12 +30,12 @@ is_port_free() {
     ! ss -tuln | grep -q ":$1 "
 }
 
-# --- ШАГ 1: УСТАНОВКА БИНАРНИКА (по инструкции) ---
+# --- УСТАНОВКА БИНАРНИКА (Шаг 1 инструкции) ---
 install_binary() {
     echo -e "${YELLOW}[*] Установка зависимостей и бинарника...${NC}"
     apt-get update -qq && apt-get install -y wget tar xxd qrencode openssl curl jq iproute2 >/dev/null 2>&1
 
-    # Официальный метод скачивания из инструкции
+    # Официальный метод определения архитектуры и скачивания
     URL="https://github.com/telemt/telemt/releases/latest/download/telemt-$(uname -m)-linux-$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu).tar.gz"
     
     wget -qO- "$URL" | tar -xz
@@ -44,12 +46,14 @@ install_binary() {
     if ! id -u telemt >/dev/null 2>&1; then
         useradd -d /opt/telemt -m -r -U telemt
     fi
+    
+    # Права на конфиг
     mkdir -p "$CONFIG_DIR"
     chown -R telemt:telemt "$CONFIG_DIR"
     echo -e "${GREEN}[+] Бинарник установлен в $BINARY_PATH${NC}"
 }
 
-# --- ШАГ 2: ГЕНЕРАЦИЯ КОНФИГА (по инструкции) ---
+# --- ГЕНЕРАЦИЯ КОНФИГА (Шаг 1 инструкции) ---
 generate_config() {
     local port=$1
     local secret=$2
@@ -96,7 +100,7 @@ EOF
     chown telemt:telemt "$CONFIG_FILE"
 }
 
-# --- ШАГ 3: СОЗДАНИЕ СЛУЖБЫ (по инструкции) ---
+# --- СОЗДАНИЕ СЛУЖБЫ (Шаг 3 инструкции) ---
 manage_service() {
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
@@ -124,11 +128,15 @@ EOF
     systemctl restart telemt
 }
 
+# --- МЕНЮ УСТАНОВКИ ---
 menu_install() {
     clear
     echo -e "${CYAN}=== Установка Telemt (Official Way) ===${NC}"
     
-    # Выбор домена
+    # ПРОВЕРКА ДИРЕКТОРИИ (чтобы не было ошибок записи)
+    mkdir -p "$CONFIG_DIR"
+
+    # 1. Выбор домена
     echo -e "\n${YELLOW}Выберите Fake TLS домен:${NC}"
     echo "1) petrovich.ru (default)"
     echo "2) google.com"
@@ -143,67 +151,76 @@ menu_install() {
     esac
     echo "$domain" > "$DOMAIN_FILE"
 
-    # Выбор порта
+    # 2. Выбор порта
     read -p "Введите порт (по умолчанию 443): " port
     port=${port:-443}
     while ! is_port_free "$port"; do
-        echo -e "${RED}Порт $port занят!${NC}"
+        echo -e "${RED}Порт $port занят другим процессом!${NC}"
         read -p "Введите другой порт: " port
     done
     echo "$port" > "$PORT_FILE"
 
-    # Генерация секрета
+    # 3. IP и Секреты
+    host=$(curl -s -4 https://api.ipify.org)
+    echo "$host" > "$IP_FILE"
+    
     secret=$(openssl rand -hex 16)
     echo "$secret" > "$SECRET_FILE"
     
-    # Тэг
     tag=$(cat "$TAG_FILE" 2>/dev/null || echo "00000000000000000000000000000000")
 
+    # Выполнение установки
     install_binary
     generate_config "$port" "$secret" "$domain" "$tag"
     manage_service
     
-    echo -e "${GREEN}[+] Установка завершена!${NC}"
+    echo -e "\n${GREEN}[+] Установка завершена!${NC}"
     show_data
-    read -p "Нажмите Enter..."
+    read -p "Нажмите Enter для продолжения..."
 }
 
+# --- ВЫВОД ДАННЫХ (Шаг 7 инструкции) ---
 show_data() {
-    if ! systemctl is-active --quiet telemt; then echo -e "${RED}Сервис не запущен!${NC}"; return; fi
+    if ! systemctl is-active --quiet telemt; then 
+        echo -e "${RED}Сервис не запущен! Проверьте логи.${NC}"
+        return
+    fi
     
-    # Получаем ссылку через API (Шаг 7 инструкции)
-    # Используем jq для парсинга, как в гайде
-    echo -e "\n${GREEN}=== ССЫЛКИ ИЗ API TELEMT ===${NC}"
-    curl -s http://127.0.0.1:9091/v1/users | jq -r '.data[] | "Пользователь: \(.username)\nСсылка: \(.links.tls[0])\n"'
-    
-    # Дублируем QR для удобства
-    LINK=$(curl -s http://127.0.0.1:9091/v1/users | jq -r '.data[0].links.tls[0]')
-    if [ "$LINK" != "null" ]; then
+    echo -e "\n${GREEN}=== ССЫЛКИ ДЛЯ ПОДКЛЮЧЕНИЯ (из API) ===${NC}"
+    # Запрос к API Telemt для получения актуальной ссылки
+    RAW_DATA=$(curl -s http://127.0.0.1:9091/v1/users)
+    LINK=$(echo "$RAW_DATA" | jq -r '.data[0].links.tls[0]')
+
+    if [ "$LINK" != "null" ] && [ ! -z "$LINK" ]; then
+        echo -e "Ссылка: ${CYAN}$LINK${NC}\n"
         qrencode -t ANSIUTF8 "$LINK"
+    else
+        echo -e "${RED}Не удалось получить ссылку из API. Попробуйте перезапустить сервис.${NC}"
     fi
 }
 
-# --- ГЛАВНОЕ МЕНЮ ---
+# --- ОСНОВНОЙ ЦИКЛ ---
 check_root
 
 while true; do
     clear
-    echo -e "${CYAN}=== Telemt Manager (Based on Official Guide) ===${NC}"
-    echo "1) Установить / Переустановить"
-    echo "2) Показать ссылки (API)"
+    echo -e "${CYAN}=== Telemt Manager (Official Guide) ===${NC}"
+    echo "1) Установить / Обновить (Авто-проверка порта)"
+    echo "2) Показать QR и ссылки"
     echo "3) Установить AD TAG"
-    echo "4) Статус и Логи"
-    echo "5) Удалить (Purge)"
+    echo "4) Статус службы и Логи"
+    echo "5) Полное удаление (Purge)"
     echo "0) Выход"
     read -p "Выбор: " idx
     case $idx in
         1) menu_install ;;
         2) show_data; read -p "Enter..." ;;
-        3) read -p "Введите AD TAG: " nt; echo "$nt" > "$TAG_FILE"; 
-           generate_config "$(cat $PORT_FILE)" "$(cat $SECRET_FILE)" "$(cat $DOMAIN_FILE)" "$nt";
-           systemctl restart telemt; echo "Готово"; sleep 1 ;;
-        4) systemctl status telemt; echo "--- Последние 20 строк логов ---"; journalctl -u telemt -n 20; read -p "Enter..." ;;
-        5) systemctl stop telemt; systemctl disable telemt; rm -rf "$CONFIG_DIR" "$SERVICE_FILE" "$BINARY_PATH"; userdel -r telemt; echo "Очищено"; sleep 1 ;;
+        3) read -p "Введите AD TAG: " nt; 
+           [ ! -z "$nt" ] && echo "$nt" > "$TAG_FILE" && \
+           generate_config "$(cat $PORT_FILE)" "$(cat $SECRET_FILE)" "$(cat $DOMAIN_FILE)" "$nt" && \
+           systemctl restart telemt && echo "Тег обновлен!"; sleep 1 ;;
+        4) systemctl status telemt; echo -e "\n--- Последние логи ---"; journalctl -u telemt -n 20 --no-pager; read -p "Enter..." ;;
+        5) systemctl stop telemt; systemctl disable telemt; rm -rf "$CONFIG_DIR" "$SERVICE_FILE" "$BINARY_PATH"; userdel -r telemt; echo "Система очищена"; sleep 1 ;;
         0) exit ;;
     esac
 done
