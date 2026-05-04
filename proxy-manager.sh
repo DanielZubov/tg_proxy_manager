@@ -65,8 +65,10 @@ manage_service() {
     local secret=$2
     local tag=$3
     
-    AD_TAG=""
-    [ ! -z "$tag" ] && AD_TAG="-t $tag"
+    # Используем полный флаг --ad-tag вместо короткого -t, 
+    # чтобы mtg не путал его с тайм-аутом.
+    PROMO_ARG=""
+    [ ! -z "$tag" ] && PROMO_ARG="--ad-tag=$tag"
 
     cat <<EOF > "$SERVICE_FILE"
 [Unit]
@@ -75,7 +77,8 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$BINARY_PATH simple-run -n 1.1.1.1 -i prefer-ipv4 $AD_TAG 0.0.0.0:$port $secret
+# Явно задаем bind через -b и используем длинные флаги для надежности
+ExecStart=$BINARY_PATH simple-run -n 1.1.1.1 -i prefer-ipv4 $PROMO_ARG -b 0.0.0.0:$port $secret
 Restart=always
 RestartSec=3
 StandardOutput=journal
@@ -88,7 +91,7 @@ EOF
     systemctl daemon-reload
     systemctl enable mtg
     systemctl restart mtg
-    echo -e "${GREEN}[+] Сервис mtg запущен на порту $port${NC}"
+    echo -e "${GREEN}[+] Сервис mtg перезапущен с исправленными флагами!${NC}"
 }
 
 menu_install() {
