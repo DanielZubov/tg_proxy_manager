@@ -13,19 +13,16 @@ WHITE='\033[1;37m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# --- СИСТЕМНЫЕ ПРОВЕРКИ ---
 check_root() {
     if [ "$EUID" -ne 0 ]; then echo -e "${RED}Ошибка: запустите через sudo!${NC}"; exit 1; fi
 }
 
 install_deps() {
     if ! command -v docker &> /dev/null; then
-        echo -e "${YELLOW}[*] Установка Docker...${NC}"
         curl -fsSL https://get.docker.com | sh
         systemctl enable --now docker
     fi
     if ! command -v qrencode &> /dev/null; then
-        echo -e "${YELLOW}[*] Установка qrencode...${NC}"
         apt-get update && apt-get install -y qrencode || yum install -y qrencode
     fi
     cp "$0" "$BINARY_PATH" && chmod +x "$BINARY_PATH"
@@ -35,14 +32,15 @@ get_ip() {
     curl -s -4 --max-time 5 https://api.ipify.org || echo "0.0.0.0"
 }
 
-# --- ПАНЕЛЬ ДАННЫХ ---
 show_config() {
     if ! docker ps | grep -q "mtproto-proxy"; then 
         echo -e "${RED}Прокси не запущен!${NC}"
         return
     fi
     
-    SECRET=$(docker inspect mtproto-proxy --format='{{range .Config.Cmd}}{{.}} {{end}}' | awk '{print $NF}')
+    # Извлекаем данные из запущенного контейнера
+    CMD_ARGS=$(docker inspect mtproto-proxy --format='{{range .Config.Cmd}}{{.}} {{end}}')
+    SECRET=$(echo $CMD_ARGS | awk '{print $NF}')
     PORT=$(docker inspect mtproto-proxy --format='{{range $p, $conf := .HostConfig.PortBindings}}{{(index $conf 0).HostPort}}{{end}}' 2>/dev/null)
     
     if [ -f "$CONFIG_FILE" ]; then
@@ -62,48 +60,33 @@ show_config() {
     qrencode -t ANSIUTF8 "$LINK"
 }
 
-# --- УСТАНОВКА ---
 menu_install() {
     clear
     echo -e "${CYAN}--- Настройка Fake TLS (маскировка) ---${NC}"
-    echo "Выберите домен для маскировки трафика:"
-    
-    domains=(
-        "max.ru" "lenta.ru" "rbc.ru" "ria.ru" "kommersant.ru"
-        "google.com" "github.com" "wikipedia.org" "habr.com" "yandex.ru"
-    )
-    
+    domains=("max.ru" "lenta.ru" "rbc.ru" "ria.ru" "google.com" "github.com")
     for i in "${!domains[@]}"; do
         printf "${YELLOW}%2d)${NC} %-18s " "$((i+1))" "${domains[$i]}"
         [[ $(( (i+1) % 2 )) -eq 0 ]] && echo ""
     done
-    
-    echo -e "\n"
-    read -p "Ваш выбор [1-10, default 1]: " d_idx
+    echo -ne "\nВыбор домена [1-6, default 1]: "
+    read d_idx
     FAKE_DOMAIN=${domains[$((d_idx-1))]}
     FAKE_DOMAIN=${FAKE_DOMAIN:-max.ru}
 
+    echo -e "\n${CYAN}--- Настройка промо-канала ---${NC}"
+    echo -e "${YELLOW}Получите тег у @MTProxybot, чтобы закрепить канал в топе${NC}"
+    read -p "Введите AD TAG (пусто для пропуска): " AD_TAG
+
     echo -e "\n${CYAN}--- Настройка публичного адреса ---${NC}"
-    read -p "Введите ваш ДОМЕН для ссылки (например, proxy.myserver.com). Пусто = IP: " PUB_HOST
-    if [ -z "$PUB_HOST" ]; then
-        PUB_HOST=$(get_ip)
-    fi
+    read -p "Введите ваш ДОМЕН для ссылки. Пусто = IP: " PUB_HOST
+    if [ -z "$PUB_HOST" ]; then PUB_HOST=$(get_ip); fi
     echo "$PUB_HOST" > "$CONFIG_FILE"
 
-    # --- АВТОПОДБОР ПОРТА ---
     PORT=443
-    echo -ne "\n🔍 Проверка порта ${PORT}... "
     if ss -tuln | grep -q ":${PORT} "; then
-        echo -e "${YELLOW}занят${NC}"
-        for alt_port in 9443 8443 8444 8445; do
-            if ! ss -tuln | grep -q ":${alt_port} "; then
-                PORT=$alt_port
-                echo -e "✅ Испольуем свободный порт: ${GREEN}${PORT}${NC}"
-                break
-            fi
+        for alt_port in 9443 8443 8444; do
+            if ! ss -tuln | grep -q ":${alt_port} "; then PORT=$alt_port; break; fi
         done
-    else
-        echo -e "${GREEN}свободен${NC}"
     fi
 
     echo -e "\n${YELLOW}[*] Настройка прокси...${NC}"
@@ -111,13 +94,19 @@ menu_install() {
     
     docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null
     
-    # Запуск mtg v2
+    # Формируем команду запуска
+    # Если AD_TAG не пустой, добавляем аргумент -t
+    AD_ARG=""
+    if [ ! -z "$AD_TAG" ]; then
+        AD_ARG="-t $AD_TAG"
+    fi
+
     docker run -d --name mtproto-proxy --restart always -p "$PORT":"$PORT" \
-        nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 0.0.0.0:"$PORT" "$SECRET" > /dev/null
+        nineseconds/mtg:2 simple-run -n 1.1.1.1 -i prefer-ipv4 $AD_ARG 0.0.0.0:"$PORT" "$SECRET" > /dev/null
     
     echo -e "${GREEN}Готово!${NC}"
     show_config
-    read -p "Нажмите Enter для возврата в меню..."
+    read -p "Нажмите Enter..."
 }
 
 # --- ОСНОВНОЙ ЦИКЛ ---
@@ -127,23 +116,17 @@ install_deps
 while true; do
     clear
     echo -e "${BLUE}======================================${NC}"
-    echo -e "${WHITE}    Hikamo Proxy Manager     ${NC}"
+    echo -e "${WHITE}    Hikamo Proxy Manager    ${NC}"
     echo -e "${BLUE}======================================${NC}"
     echo -e "1) ${GREEN}Установить / Обновить прокси${NC}"
     echo -e "2) Показать данные и QR-код${NC}"
     echo -e "3) ${RED}Удалить прокси${NC}"
     echo -e "0) Выход${NC}"
-    echo -e "${BLUE}--------------------------------------${NC}"
     read -p "Выберите пункт: " m_idx
-    
     case $m_idx in
         1) menu_install ;;
         2) clear; show_config; read -p "Нажмите Enter..." ;;
-        3) 
-            docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null
-            rm -f "$CONFIG_FILE"
-            echo -e "${YELLOW}Прокси удален.${NC}"; sleep 2 ;;
+        3) docker stop mtproto-proxy &>/dev/null && docker rm mtproto-proxy &>/dev/null; rm -f "$CONFIG_FILE"; echo "Удалено"; sleep 1 ;;
         0) exit 0 ;;
-        *) echo -e "${RED}Неверный пункт!${NC}"; sleep 1 ;;
     esac
 done
