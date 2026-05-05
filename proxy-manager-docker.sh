@@ -16,7 +16,7 @@ TAG_FILE="$DOCKER_DIR/tag.conf"
 # Приоритетные порты
 PREFERRED_PORTS=(9444 8444 9443 8443 8080 8880 4343 4443 7443 6443)
 
-# Популярные домены (международные + РФ)
+# Популярные домены
 POPULAR_DOMAINS=(
     "google.com"
     "cloudflare.com"
@@ -39,6 +39,34 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# --- ОПРЕДЕЛЕНИЕ КОМАНДЫ DOCKER COMPOSE ---
+DOCKER_COMPOSE_CMD=""
+
+detect_docker_compose() {
+    # Проверяем новую команду docker compose (без дефиса)
+    if docker compose version &>/dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker compose"
+        echo -e "${GREEN}[+] Использую 'docker compose'${NC}"
+        return 0
+    fi
+    
+    # Проверяем старую команду docker-compose (с дефисом)
+    if command -v docker-compose &>/dev/null 2>&1; then
+        DOCKER_COMPOSE_CMD="docker-compose"
+        echo -e "${GREEN}[+] Использую 'docker-compose'${NC}"
+        return 0
+    fi
+    
+    echo -e "${RED}[!] Docker Compose не найден!${NC}"
+    return 1
+}
+
+# Функция-обертка для выполнения docker compose команд
+docker_compose() {
+    cd "$DOCKER_DIR"
+    $DOCKER_COMPOSE_CMD "$@"
+}
+
 # --- СЛУЖЕБНЫЕ ФУНКЦИИ ---
 
 check_root() {
@@ -49,7 +77,7 @@ check_root() {
 }
 
 check_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
+    if ! command -v docker &>/dev/null; then
         echo -e "${YELLOW}[*] Установка Docker...${NC}"
         curl -fsSL https://get.docker.com -o get-docker.sh
         sh get-docker.sh
@@ -57,12 +85,36 @@ check_docker() {
         echo -e "${GREEN}[+] Docker установлен${NC}"
     fi
     
-    if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+    # Проверяем версию Docker
+    DOCKER_VERSION=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+    echo -e "${BLUE}[*] Версия Docker: $DOCKER_VERSION${NC}"
+    
+    # Устанавливаем Docker Compose если нужно
+    if ! docker compose version &>/dev/null 2>&1 && ! command -v docker-compose &>/dev/null; then
         echo -e "${YELLOW}[*] Установка Docker Compose...${NC}"
-        apt-get update -qq
-        apt-get install -y -qq docker-compose
+        
+        # Определяем архитектуру
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "x86_64" ]; then
+            COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-Linux-x86_64"
+        elif [ "$ARCH" = "aarch64" ]; then
+            COMPOSE_URL="https://github.com/docker/compose/releases/latest/download/docker-compose-Linux-aarch64"
+        else
+            # Если не можем определить, ставим через apt
+            apt-get update -qq
+            apt-get install -y -qq docker-compose
+        fi
+        
+        if [ ! -z "$COMPOSE_URL" ]; then
+            curl -L "$COMPOSE_URL" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+        fi
+        
         echo -e "${GREEN}[+] Docker Compose установлен${NC}"
     fi
+    
+    # Определяем какую команду использовать
+    detect_docker_compose
 }
 
 install_deps() {
@@ -108,99 +160,13 @@ validate_domain() {
 
 validate_ip_or_domain() {
     local input=$1
-    # Проверка на IP
     if [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         return 0
     fi
-    # Проверка на домен
     if [[ "$input" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
         return 0
     fi
     return 1
-}
-
-# Новая функция: проверка что домен резолвится в IP сервера
-validate_public_host() {
-    local public_host=$1
-    local server_ip=$2
-    
-    # Если публичный хост - это IP адрес
-    if [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if [ "$public_host" != "$server_ip" ]; then
-            echo -e "${RED}[!] ВНИМАНИЕ: Вы указали IP $public_host, но IP сервера $server_ip${NC}"
-            echo -e "${YELLOW}Убедитесь, что клиенты будут использовать правильный адрес!${NC}"
-            read -p "Продолжить? (y/N): " cont
-            [ "$cont" != "y" ] && return 1
-        fi
-        return 0
-    fi
-    
-    # Если публичный хост - это домен
-    echo -e "${BLUE}[*] Проверка DNS для $public_host...${NC}"
-    
-    # Пробуем разные DNS сервера для резолвинга
-    local resolved_ip=""
-    for dns in "8.8.8.8" "1.1.1.1" "77.88.8.8" "8.8.4.4"; do
-        resolved_ip=$(dig +short @$dns "$public_host" A 2>/dev/null | head -1)
-        if [ ! -z "$resolved_ip" ]; then
-            break
-        fi
-    done
-    
-    # Если dig не сработал, пробуем host
-    if [ -z "$resolved_ip" ]; then
-        resolved_ip=$(host "$public_host" 2>/dev/null | awk '/has address/ {print $NF; exit}')
-    fi
-    
-    # Если все еще пусто, пробуем nslookup
-    if [ -z "$resolved_ip" ]; then
-        resolved_ip=$(nslookup "$public_host" 2>/dev/null | grep -A1 "Name:" | grep "Address:" | awk '{print $2}' | head -1)
-    fi
-    
-    if [ -z "$resolved_ip" ]; then
-        echo -e "${RED}[!] Домен $public_host не резолвится!${NC}"
-        echo -e "${YELLOW}Возможные причины:${NC}"
-        echo -e "  - Домен не зарегистрирован или не настроен"
-        echo -e "  - DNS записи еще не распространились"
-        echo -e "  - Указан неверный домен"
-        echo ""
-        read -p "Использовать IP адрес $server_ip вместо домена? (Y/n): " use_ip
-        if [ "$use_ip" != "n" ]; then
-            public_host="$server_ip"
-            echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
-        else
-            echo -e "${RED}[!] Прокси может не работать, так как домен не резолвится${NC}"
-            read -p "Продолжить с доменом? (y/N): " cont
-            [ "$cont" != "y" ] && return 1
-        fi
-        return 0
-    fi
-    
-    echo -e "${GREEN}[+] $public_host резолвится в $resolved_ip${NC}"
-    
-    if [ "$resolved_ip" != "$server_ip" ]; then
-        echo -e "${RED}[!] ВНИМАНИЕ: Домен указывает на $resolved_ip, но сервер имеет IP $server_ip${NC}"
-        echo -e "${YELLOW}Клиенты не смогут подключиться, если DNS не настроен правильно!${NC}"
-        echo ""
-        echo -e "${BLUE}Что делать:${NC}"
-        echo -e "  1. Создайте A запись для $public_host → $server_ip"
-        echo -e "  2. Дождитесь распространения DNS (может занять до 24 часов)"
-        echo -e "  3. Или используйте IP адрес вместо домена"
-        echo ""
-        read -p "Использовать IP адрес $server_ip? (Y/n): " use_ip
-        if [ "$use_ip" != "n" ]; then
-            public_host="$server_ip"
-            echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
-        else
-            echo -e "${YELLOW}[!] Продолжаем с доменом, но проверьте DNS настройки!${NC}"
-            read -p "Нажмите Enter чтобы продолжить..."
-        fi
-    else
-        echo -e "${GREEN}[+] Отлично! Домен правильно указывает на ваш сервер${NC}"
-    fi
-    
-    eval "$2='$public_host'"
-    return 0
 }
 
 network_diagnostics() {
@@ -249,15 +215,11 @@ network_diagnostics() {
         fi
     fi
     
-    echo -e "\n${YELLOW}[4] Проверка доступности снаружи:${NC}"
-    local ext_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    if [ ! -z "$ext_ip" ]; then
-        echo -e "${BLUE}Внешний IP: $ext_ip${NC}"
-        echo -e "${YELLOW}Проверить порт можно на: https://portchecker.co/check?host=$ext_ip&port=$port${NC}"
-    fi
-    
-    echo -e "\n${YELLOW}[5] Статус контейнера:${NC}"
+    echo -e "\n${YELLOW}[4] Статус контейнера:${NC}"
     docker ps --filter name=telemt --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    
+    echo -e "\n${YELLOW}[5] Версия Docker Compose:${NC}"
+    $DOCKER_COMPOSE_CMD version 2>/dev/null || echo -e "${RED}Docker Compose не найден${NC}"
 }
 
 generate_docker_compose() {
@@ -266,6 +228,8 @@ generate_docker_compose() {
     echo -e "${YELLOW}[*] Создание docker-compose.yml...${NC}"
     
     cat > "$DOCKER_COMPOSE_FILE" << EOF
+version: '3.8'
+
 services:
   telemt:
     image: whn0thacked/telemt-docker:latest
@@ -289,12 +253,12 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 EOF
+    
+    # Добавляем version только для старых версий
+    if [[ "$DOCKER_COMPOSE_CMD" == "docker-compose" ]]; then
+        sed -i '1i version: "3.8"\n' "$DOCKER_COMPOSE_FILE"
+    fi
     
     echo -e "${GREEN}[+] docker-compose.yml создан${NC}"
 }
@@ -363,8 +327,8 @@ start_docker_container() {
     echo -e "${YELLOW}[*] Запуск Docker контейнера...${NC}"
     
     cd "$DOCKER_DIR"
-    docker compose down 2>/dev/null
-    docker compose up -d
+    docker_compose down 2>/dev/null
+    docker_compose up -d
     
     echo -e "${YELLOW}[*] Ожидание запуска (10 секунд)...${NC}"
     sleep 10
@@ -374,7 +338,7 @@ start_docker_container() {
         return 0
     else
         echo -e "${RED}[!] Ошибка запуска контейнера${NC}"
-        docker compose logs --tail=30
+        docker_compose logs --tail=30
         return 1
     fi
 }
@@ -394,7 +358,6 @@ show_data() {
     
     echo -e "\n${GREEN}=== ДАННЫЕ ДЛЯ ПОДКЛЮЧЕНИЯ ===${NC}"
     
-    # Получаем ссылку из логов
     LINK=$(docker logs telemt 2>&1 | grep -oE 'tg://proxy[^[:space:]]+' | head -1)
     
     if [ ! -z "$LINK" ]; then
@@ -402,24 +365,21 @@ show_data() {
         echo -e "${GREEN}$LINK${NC}"
         show_qr "$LINK"
         
-        # Данные для ручной настройки
-        echo -e "\n${CYAN}📋 Данные для ручной настройки:${NC}"
         if [ -f "$PUBLIC_HOST_FILE" ] && [ -f "$PORT_FILE" ] && [ -f "$SECRET_FILE" ]; then
             HOST=$(cat "$PUBLIC_HOST_FILE")
             PORT=$(cat "$PORT_FILE")
             SECRET=$(cat "$SECRET_FILE")
+            echo -e "\n${CYAN}📋 Данные для ручной настройки:${NC}"
             echo -e "  ${BLUE}HOST:${NC} $HOST"
             echo -e "  ${BLUE}PORT:${NC} $PORT"
             echo -e "  ${BLUE}SECRET:${NC} $SECRET"
+            
+            echo -e "\n${CYAN}📢 Для настройки промо канала:${NC}"
+            echo -e "  ${BLUE}HOST:PORT${NC} $HOST:$PORT"
+            echo -e "  ${BLUE}Secret:${NC} $SECRET"
         fi
-        
-        # Данные для промо канала
-        echo -e "\n${CYAN}📢 Для настройки промо канала (MTProto формата):${NC}"
-        echo -e "  ${BLUE}HOST:PORT${NC} $HOST:$PORT"
-        echo -e "  ${BLUE}Secret:${NC} $SECRET"
-        
     else
-        echo -e "${YELLOW}[!] Ссылка еще не сгенерирована, попробуйте позже${NC}"
+        echo -e "${YELLOW}[!] Ссылка еще не сгенерирована${NC}"
         echo -e "${BLUE}Проверьте логи: docker logs telemt --tail=30${NC}"
     fi
 }
@@ -440,14 +400,12 @@ menu_install() {
     check_docker
     install_deps
     
-    # Создаем директорию
     mkdir -p "$DOCKER_DIR"
     cd "$DOCKER_DIR"
     
-    # Останавливаем старый контейнер если есть
-    docker compose down 2>/dev/null
+    docker_compose down 2>/dev/null
 
-    # 1. Fake TLS домен
+    # Шаг 1: Fake TLS домен
     echo -e "\n${YELLOW}Шаг 1: Fake TLS домен${NC}"
     echo "Выберите домен или укажите свой:"
     local i=1
@@ -476,12 +434,10 @@ menu_install() {
     echo "$domain" > "$DOMAIN_FILE"
     echo -e "${GREEN}[+] Fake TLS: $domain${NC}"
 
-    # 2. Публичный хост (с проверкой DNS)
+    # Шаг 2: Публичный хост
     echo -e "\n${YELLOW}Шаг 2: Публичный адрес${NC}"
     server_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    if [ -z "$server_ip" ] || [ "$server_ip" = "null" ]; then
-        server_ip=$(hostname -I | awk '{print $1}')
-    fi
+    [ -z "$server_ip" ] && server_ip=$(hostname -I | awk '{print $1}')
     
     echo -e "IP сервера: ${GREEN}$server_ip${NC}"
     
@@ -489,74 +445,17 @@ menu_install() {
         read -p "Публичный хост/IP [$server_ip]: " public_host
         public_host=${public_host:-$server_ip}
         
-        # Валидация формата
-        if ! validate_ip_or_domain "$public_host"; then
-            echo -e "${RED}[!] Неверный формат. Введите IP или домен (например: example.com)${NC}"
-            continue
+        if validate_ip_or_domain "$public_host"; then
+            break
+        else
+            echo -e "${RED}[!] Неверный формат. Введите IP или домен${NC}"
         fi
-        
-        # Проверка DNS резолвинга для доменов
-        if [[ "$public_host" =~ [a-zA-Z] ]] && ! [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # Это домен, проверяем резолвинг
-            local resolved_ip=""
-            for dns in "8.8.8.8" "1.1.1.1" "77.88.8.8"; do
-                resolved_ip=$(dig +short @$dns "$public_host" A 2>/dev/null | head -1)
-                [ ! -z "$resolved_ip" ] && break
-            done
-            
-            if [ -z "$resolved_ip" ]; then
-                echo -e "${RED}[!] Домен $public_host не резолвится!${NC}"
-                echo -e "${YELLOW}Проверьте DNS записи или используйте IP адрес${NC}"
-                echo ""
-                read -p "Использовать IP $server_ip? (Y/n): " use_ip
-                if [ "$use_ip" != "n" ]; then
-                    public_host="$server_ip"
-                    echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
-                    break
-                else
-                    continue
-                fi
-            fi
-            
-            echo -e "${GREEN}[+] DNS: $public_host → $resolved_ip${NC}"
-            
-            if [ "$resolved_ip" != "$server_ip" ]; then
-                echo -e "${RED}[!] ВНИМАНИЕ: Домен указывает на $resolved_ip, но сервер имеет IP $server_ip${NC}"
-                echo -e "${YELLOW}Клиенты не смогут подключиться!${NC}"
-                echo ""
-                echo -e "${BLUE}Рекомендации:${NC}"
-                echo -e "  1. Создайте A запись: $public_host → $server_ip"
-                echo -e "  2. Или используйте IP адрес вместо домена"
-                echo ""
-                read -p "Использовать IP $server_ip? (Y/n): " use_ip
-                if [ "$use_ip" != "n" ]; then
-                    public_host="$server_ip"
-                    echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
-                else
-                    echo -e "${YELLOW}[!] Продолжаем с доменом, но убедитесь что DNS настроен правильно!${NC}"
-                    read -p "Нажмите Enter чтобы продолжить..."
-                fi
-            else
-                echo -e "${GREEN}[+] Отлично! Домен правильно указывает на ваш сервер${NC}"
-            fi
-        elif [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            # Это IP адрес
-            if [ "$public_host" != "$server_ip" ]; then
-                echo -e "${YELLOW}[!] Вы указали IP $public_host, но реальный IP сервера $server_ip${NC}"
-                echo -e "${YELLOW}Убедитесь, что это правильный публичный IP${NC}"
-                read -p "Продолжить? (y/N): " cont
-                if [ "$cont" != "y" ]; then
-                    continue
-                fi
-            fi
-        fi
-        break
     done
     
     echo "$public_host" > "$PUBLIC_HOST_FILE"
     echo -e "${GREEN}[+] Публичный хост: $public_host${NC}"
 
-    # 3. Порт
+    # Шаг 3: Порт
     echo -e "\n${YELLOW}Шаг 3: Выбор порта${NC}"
     echo -e "${BLUE}Рекомендуемые порты: ${PREFERRED_PORTS[*]}${NC}"
     read -p "Порт (Enter для автоподбора): " user_port
@@ -579,7 +478,7 @@ menu_install() {
     echo "$port" > "$PORT_FILE"
     echo -e "${GREEN}[+] Выбран порт: $port${NC}"
 
-    # 4. Пользователь и секреты
+    # Шаг 4: Пользователь
     echo -e "\n${YELLOW}Шаг 4: Настройка доступа${NC}"
     read -p "Имя пользователя (Enter=user1): " username
     username=${username:-user1}
@@ -590,8 +489,8 @@ menu_install() {
     
     # AD TAG
     echo -e "\n${YELLOW}Шаг 5: AD TAG (опционально)${NC}"
-    echo -e "${BLUE}TAG используется для статистики в @MTProxybot. Оставьте пустым, если не нужен.${NC}"
-    read -p "AD TAG (32 hex символа или Enter для пропуска): " tag
+    echo -e "${BLUE}TAG для статистики в @MTProxybot. 32 hex символа.${NC}"
+    read -p "AD TAG (Enter для пропуска): " tag
     if [ -z "$tag" ]; then
         tag=""
         echo -e "${YELLOW}[!] TAG не установлен${NC}"
@@ -603,7 +502,6 @@ menu_install() {
         tag=""
     fi
 
-    # Создаем файлы
     generate_docker_compose "$port"
     
     if ! generate_config "$port" "$secret" "$domain" "$tag" "$public_host" "$username"; then
@@ -616,14 +514,12 @@ menu_install() {
         return 1
     fi
     
-    # Диагностика сети
     network_diagnostics "$port" "$public_host"
     
     echo -e "\n${GREEN}=== УСТАНОВКА ЗАВЕРШЕНА! ===${NC}"
     echo -e "${CYAN}📁 Директория: $DOCKER_DIR${NC}"
-    echo -e "${CYAN}🔧 Управление: cd $DOCKER_DIR && docker compose [up|down|logs|restart]${NC}"
+    echo -e "${CYAN}🔧 Управление: cd $DOCKER_DIR && $DOCKER_COMPOSE_CMD [up|down|logs|restart]${NC}"
     
-    # Показываем данные для подключения
     show_data
     
     read -p $'\nНажмите Enter для продолжения...'
@@ -669,9 +565,9 @@ while true; do
                 username=$(cat "$USERNAME_FILE")
                 
                 generate_config "$port" "$secret" "$domain" "$nt" "$public_host" "$username"
-                cd "$DOCKER_DIR" && docker compose restart
+                cd "$DOCKER_DIR" && docker_compose restart
                 sleep 5
-                echo -e "${GREEN}[+] AD TAG обновлен, контейнер перезапущен${NC}"
+                echo -e "${GREEN}[+] AD TAG обновлен${NC}"
                 show_data
             else
                 echo -e "${RED}[!] Неверный формат. Нужно 32 hex символа${NC}"
@@ -692,7 +588,7 @@ while true; do
         5) 
             if [ -f "$DOCKER_COMPOSE_FILE" ]; then
                 cd "$DOCKER_DIR"
-                docker compose restart
+                docker_compose restart
                 sleep 5
                 echo -e "${GREEN}[+] Контейнер перезапущен${NC}"
             else
@@ -718,7 +614,7 @@ while true; do
             echo -e "${RED}=== ПОЛНОЕ УДАЛЕНИЕ ===${NC}"
             read -p "Введите 'yes' для подтверждения: " confirm
             if [ "$confirm" = "yes" ]; then
-                cd "$DOCKER_DIR" 2>/dev/null && docker compose down -v 2>/dev/null
+                cd "$DOCKER_DIR" 2>/dev/null && docker_compose down -v 2>/dev/null
                 docker rm -f telemt 2>/dev/null
                 docker rmi -f whn0thacked/telemt-docker:latest 2>/dev/null
                 rm -rf "$DOCKER_DIR"
