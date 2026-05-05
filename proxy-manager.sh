@@ -455,7 +455,7 @@ check_root
 while true; do
     clear
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║     Telemt Proxy Manager v3.0       ║${NC}"
+    echo -e "${CYAN}║     Hikamo Proxy Manager v3.0        ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     echo "1) 🚀 Установить / Обновить"
     echo "2) 📱 Показать QR и ссылки"
