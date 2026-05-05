@@ -14,7 +14,7 @@ PUBLIC_HOST_FILE="$CONFIG_DIR/public_host.conf"
 USERNAME_FILE="$CONFIG_DIR/username.conf"
 TAG_FILE="$CONFIG_DIR/tag.conf"
 
-# Приоритетные порты для автоподбора (популярные свободные порты)
+# Приоритетные порты для автоподбора
 PREFERRED_PORTS=(9444 8444 9443 8443 8080 8880 4343 4443 7443 6443)
 
 # --- ЦВЕТА ---
@@ -58,7 +58,6 @@ is_port_free() {
 find_free_port() {
     echo -e "${YELLOW}[*] Поиск свободного порта...${NC}" >&2
     
-    # Проверяем приоритетные порты
     for port in "${PREFERRED_PORTS[@]}"; do
         if is_port_free "$port"; then
             echo "$port"
@@ -66,7 +65,6 @@ find_free_port() {
         fi
     done
     
-    # Если все заняты, ищем в диапазоне 10000-11000
     for port in $(seq 10000 11000); do
         if is_port_free "$port"; then
             echo "$port"
@@ -82,6 +80,7 @@ init_dirs() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$DOCKER_COMPOSE_DIR/tlsfront"
     chmod 755 "$CONFIG_DIR"
+    chmod 777 "$DOCKER_COMPOSE_DIR/tlsfront"  # Для записи временных файлов
 }
 
 network_diagnostics() {
@@ -90,13 +89,7 @@ network_diagnostics() {
     
     echo -e "\n${CYAN}=== ДИАГНОСТИКА СЕТИ ===${NC}"
     
-    # 1. Проверяем Docker сеть
-    echo -e "\n${YELLOW}[1] Docker сеть:${NC}"
-    docker network ls
-    docker network inspect bridge | grep -A5 "IPAM"
-    
-    # 2. Проверяем, слушается ли порт
-    echo -e "\n${YELLOW}[2] Прослушивание порта $port:${NC}"
+    echo -e "\n${YELLOW}[1] Проверка порта $port:${NC}"
     ss -tlnp | grep ":$port "
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}[+] Порт слушается Docker'ом${NC}"
@@ -104,44 +97,33 @@ network_diagnostics() {
         echo -e "${RED}[!] Порт НЕ слушается!${NC}"
     fi
     
-    # 3. Проверяем файрвол
-    echo -e "\n${YELLOW}[3] Проверка файрвола:${NC}"
+    echo -e "\n${YELLOW}[2] Проверка файрвола:${NC}"
     
     if command -v ufw >/dev/null && ufw status | grep -q "active"; then
-        echo -e "${BLUE}UFW активен, добавляю правило...${NC}"
-        ufw allow "$port/tcp"
-        ufw allow "$port/udp"
-        echo -e "${GREEN}[+] Правила добавлены${NC}"
+        ufw allow "$port/tcp" 2>/dev/null
+        ufw allow "$port/udp" 2>/dev/null
+        echo -e "${GREEN}[+] UFW правила добавлены${NC}"
     fi
     
     if command -v iptables >/dev/null; then
         if ! iptables -L INPUT -n | grep -q "dpt:$port"; then
-            echo -e "${YELLOW}[!] Добавляю iptables правило...${NC}"
             iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
             iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+            echo -e "${GREEN}[+] iptables правила добавлены${NC}"
         fi
     fi
     
-    # 4. Проверка внешней доступности
-    echo -e "\n${YELLOW}[4] Проверка доступности снаружи:${NC}"
-    echo -e "${BLUE}Публичный адрес: $public_host${NC}"
-    
+    echo -e "\n${YELLOW}[3] Проверка доступности снаружи:${NC}"
     local ext_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
     if [ ! -z "$ext_ip" ]; then
-        echo -e "${BLUE}Проверка порта через онлайн-сервис...${NC}"
-        local check_result=$(curl -s --connect-timeout 10 "https://portchecker.co/check?host=$ext_ip&port=$port" 2>/dev/null)
-        if echo "$check_result" | grep -q '"open":true'; then
-            echo -e "${GREEN}[+] Порт $port открыт снаружи${NC}"
-        else
-            echo -e "${YELLOW}[!] Порт $port возможно закрыт снаружи${NC}"
-            echo -e "${RED}[!] ВАЖНО: Проверьте облачный файрвол!${NC}"
-        fi
+        echo -e "${BLUE}Внешний IP: $ext_ip${NC}"
+        echo -e "${YELLOW}Для проверки порта используйте:${NC}"
+        echo -e "  https://portchecker.co/check?host=$ext_ip&port=$port"
     fi
 }
 
 generate_docker_compose() {
     local port=$1
-    local public_host=$2
     
     echo -e "${YELLOW}[*] Создание docker-compose.yml...${NC}"
     
@@ -163,6 +145,7 @@ services:
     
     environment:
       RUST_LOG: info
+      RUST_BACKTRACE: 1
     
     security_opt:
       - no-new-privileges:true
@@ -171,22 +154,16 @@ services:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
+      - NET_ADMIN  # Добавляем для conntrack
     
-    read_only: true
+    read_only: false  # Меняем на false для записи временных файлов
     tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=16m
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
     
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
-    
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:9091/v1/users"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
     
     logging:
       driver: "json-file"
@@ -245,9 +222,13 @@ tls_front_dir = "tlsfront"
 
 [access.users]
 $username = "$secret"
+
+[proxy_secret]
+proxy_secret = "/etc/telemt/proxy-secret"  # Добавляем путь к proxy-secret
 EOF
     
     if [ $? -eq 0 ]; then
+        chmod 644 "$CONFIG_DIR/telemt.toml"
         echo -e "${GREEN}[+] Конфигурация создана${NC}"
         return 0
     else
@@ -260,18 +241,14 @@ start_docker_container() {
     echo -e "${YELLOW}[*] Запуск Docker контейнера...${NC}"
     
     cd "$DOCKER_COMPOSE_DIR"
+    docker compose down 2>/dev/null
     docker compose up -d --build
     
-    sleep 5
+    echo -e "${YELLOW}[*] Ожидание запуска (15 секунд)...${NC}"
+    sleep 15
     
     if docker ps | grep -q telemt; then
         echo -e "${GREEN}[+] Контейнер успешно запущен${NC}"
-        
-        # Проверяем логи на наличие ошибок
-        if docker logs telemt 2>&1 | grep -qi "error\|panic\|fatal"; then
-            echo -e "${YELLOW}[!] В логах есть ошибки, но контейнер работает${NC}"
-        fi
-        
         return 0
     else
         echo -e "${RED}[!] Ошибка запуска контейнера${NC}"
@@ -288,25 +265,38 @@ show_data() {
     
     echo -e "\n${GREEN}=== Данные для подключения ===${NC}"
     
-    # Получаем ссылки из логов контейнера
-    echo -e "\n${CYAN}Ссылки для подключения:${NC}"
-    docker logs telemt 2>&1 | grep -E "tg://proxy" | tail -5 | while read line; do
-        if [[ "$line" =~ (tg://proxy[^\ ]+) ]]; then
-            link="${BASH_REMATCH[1]}"
-            echo -e "${GREEN}$link${NC}"
-            echo ""
-            echo "$link" | qrencode -t ANSIUTF8 2>/dev/null
-            echo ""
+    # Получаем ссылки из логов контейнера (более надежный способ)
+    echo -e "\n${CYAN}📱 Ссылки для подключения:${NC}"
+    
+    # Ждем появления ссылок в логах
+    for i in {1..10}; do
+        sleep 2
+        LINKS=$(docker logs telemt 2>&1 | grep -oE 'tg://proxy[^[:space:]]+' | head -1)
+        if [ ! -z "$LINKS" ]; then
+            break
         fi
     done
     
-    # Альтернативный способ через API (если доступен)
-    echo -e "\n${YELLOW}[*] Альтернативные ссылки (через API):${NC}"
-    docker exec telemt curl -s http://127.0.0.1:9091/v1/users 2>/dev/null | jq -r '.data[] | .links.tls[]' 2>/dev/null | while read link; do
-        if [ ! -z "$link" ] && [ "$link" != "null" ]; then
+    if [ ! -z "$LINKS" ]; then
+        echo -e "${GREEN}$LINKS${NC}"
+        echo ""
+        echo -e "${YELLOW}📱 QR Code:${NC}"
+        echo "$LINKS" | qrencode -t ANSIUTF8 2>/dev/null
+        echo ""
+        
+        # Также пробуем получить через API
+        echo -e "${CYAN}📋 Дополнительные ссылки (если есть):${NC}"
+        docker exec telemt curl -s http://127.0.0.1:9091/v1/users 2>/dev/null | grep -oE 'tg://proxy[^"]+' | while read link; do
             echo -e "${GREEN}$link${NC}"
-        fi
-    done
+        done 2>/dev/null
+    else
+        echo -e "${YELLOW}[!] Ссылки еще не сгенерированы, проверьте логи:${NC}"
+        echo -e "${BLUE}docker logs telemt --tail=50${NC}"
+        
+        # Показываем последние логи
+        echo -e "\n${YELLOW}Последние логи:${NC}"
+        docker logs telemt --tail=20 2>&1 | grep -E "Listening|Proxy Links|tg://" || echo -e "${RED}[!] Ожидание инициализации...${NC}"
+    fi
 }
 
 menu_install() {
@@ -315,6 +305,9 @@ menu_install() {
     
     check_docker
     init_dirs
+
+    # Останавливаем старый контейнер если есть
+    cd "$DOCKER_COMPOSE_DIR" 2>/dev/null && docker compose down 2>/dev/null
 
     # 1. Fake TLS домен
     echo -e "\n${YELLOW}Шаг 1: Fake TLS домен${NC}"
@@ -343,31 +336,13 @@ menu_install() {
     read -p "Публичный хост/IP [$server_ip]: " public_host
     public_host=${public_host:-$server_ip}
     
-    # Проверка DNS
-    if [[ "$public_host" =~ [a-zA-Z] ]] && ! [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo -e "${YELLOW}[*] Проверка DNS для $public_host...${NC}"
-        if host "$public_host" >/dev/null 2>&1; then
-            resolved_ip=$(host "$public_host" | awk '/has address/ {print $NF; exit}')
-            echo -e "${GREEN}[+] $public_host резолвится в $resolved_ip${NC}"
-            if [ "$resolved_ip" != "$server_ip" ]; then
-                echo -e "${RED}[!] ВНИМАНИЕ: DNS указывает на $resolved_ip, а сервер имеет IP $server_ip${NC}"
-                read -p "Продолжить? (y/N): " cont
-                [ "$cont" != "y" ] && return
-            fi
-        else
-            echo -e "${RED}[!] Домен $public_host не резолвится${NC}"
-            read -p "Использовать IP? (Y/n): " use_ip
-            [ "$use_ip" != "n" ] && public_host="$server_ip"
-        fi
-    fi
-    
     echo "$public_host" > "$PUBLIC_HOST_FILE"
     echo -e "${GREEN}[+] Публичный хост: $public_host${NC}"
 
-    # 3. Порт (автоподбор)
+    # 3. Порт
     echo -e "\n${YELLOW}Шаг 3: Выбор порта${NC}"
     echo -e "${BLUE}Рекомендуемые порты: ${PREFERRED_PORTS[*]}${NC}"
-    read -p "Порт (Enter для автоподбора, или укажите свой): " user_port
+    read -p "Порт (Enter для автоподбора): " user_port
     
     if [ -z "$user_port" ]; then
         free_port=$(find_free_port)
@@ -396,18 +371,17 @@ menu_install() {
     secret=$(openssl rand -hex 16)
     echo "$secret" > "$SECRET_FILE"
     
-    # Генерация случайного TAG (32 hex символа)
     tag=$(openssl rand -hex 16)
     echo "$tag" > "$TAG_FILE"
     
     echo -e "${GREEN}[+] Пользователь: $username${NC}"
-    echo -e "${GREEN}[+] Secret: ${secret:0:16}...${NC}"
-    echo -e "${GREEN}[+] TAG: ${tag:0:16}...${NC}"
+    echo -e "${GREEN}[+] Secret: ${secret}${NC}"
+    echo -e "${GREEN}[+] TAG: ${tag}${NC}"
 
     # Установка
     echo -e "\n${CYAN}=== Установка ===${NC}"
     
-    generate_docker_compose "$free_port" "$public_host"
+    generate_docker_compose "$free_port"
     
     if ! generate_config "$free_port" "$secret" "$domain" "$tag" "$public_host" "$username"; then
         echo -e "${RED}[!] Ошибка создания конфигурации${NC}"
@@ -422,12 +396,14 @@ menu_install() {
     # Диагностика сети
     network_diagnostics "$free_port" "$public_host"
     
-    echo -e "\n${GREEN}=== Установка завершена! ===${NC}"
-    echo -e "${CYAN}Директория: $DOCKER_COMPOSE_DIR${NC}"
-    echo -e "${CYAN}Для управления: cd $DOCKER_COMPOSE_DIR && docker compose [up|down|logs|restart]${NC}"
+    echo -e "\n${GREEN}=== УСТАНОВКА ЗАВЕРШЕНА! ===${NC}"
+    echo -e "${CYAN}📁 Директория: $DOCKER_COMPOSE_DIR${NC}"
+    echo -e "${CYAN}🔧 Управление: cd $DOCKER_COMPOSE_DIR && docker compose [up|down|logs|restart]${NC}"
     
+    # Показываем ссылки
     show_data
-    read -p "Нажмите Enter..."
+    
+    read -p $'\nНажмите Enter для продолжения...'
 }
 
 # --- ОСНОВНОЙ ЦИКЛ ---
@@ -436,7 +412,7 @@ check_root
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   Telemt Proxy Manager (Docker) v1.0   ║${NC}"
+    echo -e "${CYAN}║   Telemt Proxy Manager (Docker) v1.1   ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     echo "1) 🚀 Установить / Переустановить"
     echo "2) 📱 Показать QR и ссылки"
@@ -463,7 +439,6 @@ while true; do
             read -p "Новый TAG (32 hex символа): " nt
             if [ ${#nt} -eq 32 ] && [[ "$nt" =~ ^[0-9a-fA-F]+$ ]]; then
                 echo "$nt" > "$TAG_FILE"
-                # Пересоздаем конфиг и перезапускаем
                 port=$(cat "$PORT_FILE")
                 secret=$(cat "$SECRET_FILE")
                 domain=$(cat "$DOMAIN_FILE")
@@ -473,20 +448,25 @@ while true; do
                 generate_config "$port" "$secret" "$domain" "$nt" "$public_host" "$username"
                 cd "$DOCKER_COMPOSE_DIR"
                 docker compose restart
-                echo -e "${GREEN}[+] TAG обновлен, контейнер перезапущен${NC}"
+                sleep 5
+                echo -e "${GREEN}[+] TAG обновлен${NC}"
+                show_data
             else
-                echo -e "${RED}[!] Неверный формат TAG (нужно 32 hex символа)${NC}"
+                echo -e "${RED}[!] Неверный формат (нужно 32 hex символа)${NC}"
             fi
-            sleep 2
+            read -p "Enter..."
             ;;
         4) 
             if docker ps | grep -q telemt; then
-                echo -e "\n${YELLOW}Статус контейнера:${NC}"
-                docker ps --filter name=telemt
-                echo -e "\n${YELLOW}Последние логи:${NC}"
-                docker logs --tail=50 telemt
+                echo -e "\n${YELLOW}📊 Статус контейнера:${NC}"
+                docker ps --filter name=telemt --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+                echo -e "\n${YELLOW}📋 Последние логи (50 строк):${NC}"
+                docker logs --tail=50 telemt 2>&1 | tail -50
             else
                 echo -e "${RED}[!] Контейнер не запущен${NC}"
+                if [ -f "$DOCKER_COMPOSE_FILE" ]; then
+                    echo -e "${YELLOW}Для запуска: cd $DOCKER_COMPOSE_DIR && docker compose up -d${NC}"
+                fi
             fi
             read -p "Enter..." 
             ;;
@@ -494,14 +474,13 @@ while true; do
             if [ -f "$DOCKER_COMPOSE_FILE" ]; then
                 cd "$DOCKER_COMPOSE_DIR"
                 docker compose restart
-                sleep 3
-                docker ps | grep -q telemt && \
-                    echo -e "${GREEN}[+] Контейнер перезапущен${NC}" || \
-                    echo -e "${RED}[!] Ошибка перезапуска${NC}"
+                sleep 5
+                echo -e "${GREEN}[+] Контейнер перезапущен${NC}"
+                show_data
             else
                 echo -e "${RED}[!] Сначала установите прокси${NC}"
             fi
-            sleep 1
+            read -p "Enter..."
             ;;
         6)
             if [ -f "$PORT_FILE" ] && [ -f "$PUBLIC_HOST_FILE" ]; then
@@ -515,6 +494,7 @@ while true; do
             ;;
         7)
             if [ -f "$CONFIG_DIR/telemt.toml" ]; then
+                echo -e "${CYAN}=== Содержимое конфига ===${NC}"
                 cat "$CONFIG_DIR/telemt.toml"
             else
                 echo -e "${RED}[!] Конфиг не найден${NC}"
@@ -522,17 +502,15 @@ while true; do
             read -p "Enter..."
             ;;
         8) 
-            echo -e "${RED}=== ПОЛНОЕ УДАЛЕНИЕ TELEMT ===${NC}"
+            echo -e "${RED}=== ПОЛНОЕ УДАЛЕНИЕ ===${NC}"
             echo -e "${YELLOW}Будут удалены:${NC}"
             echo "  - Docker контейнер telemt"
-            echo "  - Docker образ"
             echo "  - Все конфигурационные файлы"
             echo "  - Директория $DOCKER_COMPOSE_DIR"
             echo ""
             read -p "Введите 'yes' для подтверждения: " confirm
             if [ "$confirm" = "yes" ]; then
-                cd "$DOCKER_COMPOSE_DIR" 2>/dev/null
-                docker compose down -v 2>/dev/null
+                cd "$DOCKER_COMPOSE_DIR" 2>/dev/null && docker compose down -v 2>/dev/null
                 docker rm -f telemt 2>/dev/null
                 docker rmi -f whn0thacked/telemt-docker:latest 2>/dev/null
                 rm -rf "$DOCKER_COMPOSE_DIR"
