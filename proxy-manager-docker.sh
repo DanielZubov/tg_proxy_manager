@@ -68,7 +68,7 @@ check_docker() {
 install_deps() {
     echo -e "${YELLOW}[*] Установка зависимостей...${NC}"
     apt-get update -qq
-    apt-get install -y -qq qrencode curl wget jq ufw 2>/dev/null
+    apt-get install -y -qq qrencode curl wget jq ufw dnsutils 2>/dev/null
     echo -e "${GREEN}[+] Зависимости установлены${NC}"
 }
 
@@ -119,6 +119,90 @@ validate_ip_or_domain() {
     return 1
 }
 
+# Новая функция: проверка что домен резолвится в IP сервера
+validate_public_host() {
+    local public_host=$1
+    local server_ip=$2
+    
+    # Если публичный хост - это IP адрес
+    if [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if [ "$public_host" != "$server_ip" ]; then
+            echo -e "${RED}[!] ВНИМАНИЕ: Вы указали IP $public_host, но IP сервера $server_ip${NC}"
+            echo -e "${YELLOW}Убедитесь, что клиенты будут использовать правильный адрес!${NC}"
+            read -p "Продолжить? (y/N): " cont
+            [ "$cont" != "y" ] && return 1
+        fi
+        return 0
+    fi
+    
+    # Если публичный хост - это домен
+    echo -e "${BLUE}[*] Проверка DNS для $public_host...${NC}"
+    
+    # Пробуем разные DNS сервера для резолвинга
+    local resolved_ip=""
+    for dns in "8.8.8.8" "1.1.1.1" "77.88.8.8" "8.8.4.4"; do
+        resolved_ip=$(dig +short @$dns "$public_host" A 2>/dev/null | head -1)
+        if [ ! -z "$resolved_ip" ]; then
+            break
+        fi
+    done
+    
+    # Если dig не сработал, пробуем host
+    if [ -z "$resolved_ip" ]; then
+        resolved_ip=$(host "$public_host" 2>/dev/null | awk '/has address/ {print $NF; exit}')
+    fi
+    
+    # Если все еще пусто, пробуем nslookup
+    if [ -z "$resolved_ip" ]; then
+        resolved_ip=$(nslookup "$public_host" 2>/dev/null | grep -A1 "Name:" | grep "Address:" | awk '{print $2}' | head -1)
+    fi
+    
+    if [ -z "$resolved_ip" ]; then
+        echo -e "${RED}[!] Домен $public_host не резолвится!${NC}"
+        echo -e "${YELLOW}Возможные причины:${NC}"
+        echo -e "  - Домен не зарегистрирован или не настроен"
+        echo -e "  - DNS записи еще не распространились"
+        echo -e "  - Указан неверный домен"
+        echo ""
+        read -p "Использовать IP адрес $server_ip вместо домена? (Y/n): " use_ip
+        if [ "$use_ip" != "n" ]; then
+            public_host="$server_ip"
+            echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
+        else
+            echo -e "${RED}[!] Прокси может не работать, так как домен не резолвится${NC}"
+            read -p "Продолжить с доменом? (y/N): " cont
+            [ "$cont" != "y" ] && return 1
+        fi
+        return 0
+    fi
+    
+    echo -e "${GREEN}[+] $public_host резолвится в $resolved_ip${NC}"
+    
+    if [ "$resolved_ip" != "$server_ip" ]; then
+        echo -e "${RED}[!] ВНИМАНИЕ: Домен указывает на $resolved_ip, но сервер имеет IP $server_ip${NC}"
+        echo -e "${YELLOW}Клиенты не смогут подключиться, если DNS не настроен правильно!${NC}"
+        echo ""
+        echo -e "${BLUE}Что делать:${NC}"
+        echo -e "  1. Создайте A запись для $public_host → $server_ip"
+        echo -e "  2. Дождитесь распространения DNS (может занять до 24 часов)"
+        echo -e "  3. Или используйте IP адрес вместо домена"
+        echo ""
+        read -p "Использовать IP адрес $server_ip? (Y/n): " use_ip
+        if [ "$use_ip" != "n" ]; then
+            public_host="$server_ip"
+            echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
+        else
+            echo -e "${YELLOW}[!] Продолжаем с доменом, но проверьте DNS настройки!${NC}"
+            read -p "Нажмите Enter чтобы продолжить..."
+        fi
+    else
+        echo -e "${GREEN}[+] Отлично! Домен правильно указывает на ваш сервер${NC}"
+    fi
+    
+    eval "$2='$public_host'"
+    return 0
+}
+
 network_diagnostics() {
     local port=$1
     local public_host=$2
@@ -155,14 +239,24 @@ network_diagnostics() {
         fi
     fi
     
-    echo -e "\n${YELLOW}[3] Проверка доступности снаружи:${NC}"
+    echo -e "\n${YELLOW}[3] Проверка DNS резолвинга:${NC}"
+    if [[ "$public_host" =~ [a-zA-Z] ]] && ! [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        local resolved=$(dig +short "$public_host" A 2>/dev/null | head -1)
+        if [ ! -z "$resolved" ]; then
+            echo -e "${GREEN}[+] $public_host → $resolved${NC}"
+        else
+            echo -e "${RED}[!] $public_host не резолвится!${NC}"
+        fi
+    fi
+    
+    echo -e "\n${YELLOW}[4] Проверка доступности снаружи:${NC}"
     local ext_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
     if [ ! -z "$ext_ip" ]; then
         echo -e "${BLUE}Внешний IP: $ext_ip${NC}"
         echo -e "${YELLOW}Проверить порт можно на: https://portchecker.co/check?host=$ext_ip&port=$port${NC}"
     fi
     
-    echo -e "\n${YELLOW}[4] Статус контейнера:${NC}"
+    echo -e "\n${YELLOW}[5] Статус контейнера:${NC}"
     docker ps --filter name=telemt --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 }
 
@@ -319,7 +413,7 @@ show_data() {
             echo -e "  ${BLUE}SECRET:${NC} $SECRET"
         fi
         
-        # Данные для промо канала в формате MTProto
+        # Данные для промо канала
         echo -e "\n${CYAN}📢 Для настройки промо канала (MTProto формата):${NC}"
         echo -e "  ${BLUE}HOST:PORT${NC} $HOST:$PORT"
         echo -e "  ${BLUE}Secret:${NC} $SECRET"
@@ -382,20 +476,81 @@ menu_install() {
     echo "$domain" > "$DOMAIN_FILE"
     echo -e "${GREEN}[+] Fake TLS: $domain${NC}"
 
-    # 2. Публичный хост
+    # 2. Публичный хост (с проверкой DNS)
     echo -e "\n${YELLOW}Шаг 2: Публичный адрес${NC}"
     server_ip=$(curl -s -4 --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    [ -z "$server_ip" ] && server_ip=$(hostname -I | awk '{print $1}')
+    if [ -z "$server_ip" ] || [ "$server_ip" = "null" ]; then
+        server_ip=$(hostname -I | awk '{print $1}')
+    fi
     
     echo -e "IP сервера: ${GREEN}$server_ip${NC}"
+    
     while true; do
         read -p "Публичный хост/IP [$server_ip]: " public_host
         public_host=${public_host:-$server_ip}
-        if validate_ip_or_domain "$public_host"; then
-            break
-        else
+        
+        # Валидация формата
+        if ! validate_ip_or_domain "$public_host"; then
             echo -e "${RED}[!] Неверный формат. Введите IP или домен (например: example.com)${NC}"
+            continue
         fi
+        
+        # Проверка DNS резолвинга для доменов
+        if [[ "$public_host" =~ [a-zA-Z] ]] && ! [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # Это домен, проверяем резолвинг
+            local resolved_ip=""
+            for dns in "8.8.8.8" "1.1.1.1" "77.88.8.8"; do
+                resolved_ip=$(dig +short @$dns "$public_host" A 2>/dev/null | head -1)
+                [ ! -z "$resolved_ip" ] && break
+            done
+            
+            if [ -z "$resolved_ip" ]; then
+                echo -e "${RED}[!] Домен $public_host не резолвится!${NC}"
+                echo -e "${YELLOW}Проверьте DNS записи или используйте IP адрес${NC}"
+                echo ""
+                read -p "Использовать IP $server_ip? (Y/n): " use_ip
+                if [ "$use_ip" != "n" ]; then
+                    public_host="$server_ip"
+                    echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
+                    break
+                else
+                    continue
+                fi
+            fi
+            
+            echo -e "${GREEN}[+] DNS: $public_host → $resolved_ip${NC}"
+            
+            if [ "$resolved_ip" != "$server_ip" ]; then
+                echo -e "${RED}[!] ВНИМАНИЕ: Домен указывает на $resolved_ip, но сервер имеет IP $server_ip${NC}"
+                echo -e "${YELLOW}Клиенты не смогут подключиться!${NC}"
+                echo ""
+                echo -e "${BLUE}Рекомендации:${NC}"
+                echo -e "  1. Создайте A запись: $public_host → $server_ip"
+                echo -e "  2. Или используйте IP адрес вместо домена"
+                echo ""
+                read -p "Использовать IP $server_ip? (Y/n): " use_ip
+                if [ "$use_ip" != "n" ]; then
+                    public_host="$server_ip"
+                    echo -e "${GREEN}[+] Будет использован IP: $public_host${NC}"
+                else
+                    echo -e "${YELLOW}[!] Продолжаем с доменом, но убедитесь что DNS настроен правильно!${NC}"
+                    read -p "Нажмите Enter чтобы продолжить..."
+                fi
+            else
+                echo -e "${GREEN}[+] Отлично! Домен правильно указывает на ваш сервер${NC}"
+            fi
+        elif [[ "$public_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # Это IP адрес
+            if [ "$public_host" != "$server_ip" ]; then
+                echo -e "${YELLOW}[!] Вы указали IP $public_host, но реальный IP сервера $server_ip${NC}"
+                echo -e "${YELLOW}Убедитесь, что это правильный публичный IP${NC}"
+                read -p "Продолжить? (y/N): " cont
+                if [ "$cont" != "y" ]; then
+                    continue
+                fi
+            fi
+        fi
+        break
     done
     
     echo "$public_host" > "$PUBLIC_HOST_FILE"
@@ -433,7 +588,7 @@ menu_install() {
     secret=$(openssl rand -hex 16)
     echo "$secret" > "$SECRET_FILE"
     
-    # AD TAG (для статистики в @MTProxybot)
+    # AD TAG
     echo -e "\n${YELLOW}Шаг 5: AD TAG (опционально)${NC}"
     echo -e "${BLUE}TAG используется для статистики в @MTProxybot. Оставьте пустым, если не нужен.${NC}"
     read -p "AD TAG (32 hex символа или Enter для пропуска): " tag
